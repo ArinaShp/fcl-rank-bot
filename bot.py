@@ -10,7 +10,6 @@ from typing import Final, Iterable
 import discord
 from aiohttp import web
 from discord import app_commands
-from discord.ext import commands
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -22,9 +21,9 @@ LOG_CHANNEL_ID_RAW: Final[str | None] = os.getenv("LOG_CHANNEL_ID")
 PORT: Final[int] = int(os.getenv("PORT", "10000"))
 DATABASE_PATH: Final[str] = os.getenv("DATABASE_PATH", "fcl_management.db")
 
-GUILD_ID = int(GUILD_ID_RAW) if GUILD_ID_RAW else None
-ROLE_CHANNEL_ID = int(ROLE_CHANNEL_ID_RAW) if ROLE_CHANNEL_ID_RAW else None
-LOG_CHANNEL_ID = int(LOG_CHANNEL_ID_RAW) if LOG_CHANNEL_ID_RAW else None
+GUILD_ID: Final[int | None] = int(GUILD_ID_RAW) if GUILD_ID_RAW else None
+ROLE_CHANNEL_ID: Final[int | None] = int(ROLE_CHANNEL_ID_RAW) if ROLE_CHANNEL_ID_RAW else None
+LOG_CHANNEL_ID: Final[int | None] = int(LOG_CHANNEL_ID_RAW) if LOG_CHANNEL_ID_RAW else None
 
 MANAGER_ROLE_NAMES: Final[set[str]] = {
     "Владелец",
@@ -49,11 +48,37 @@ RANK_ROLE_NAMES: Final[tuple[str, ...]] = (
 
 FAMILY_ROLE_NAMES: Final[set[str]] = set(RANK_ROLE_NAMES)
 
+
+class OptionalVoiceWarningFilter(logging.Filter):
+    HIDDEN_PARTS: Final[tuple[str, ...]] = (
+        "PyNaCl is not installed",
+        "davey is not installed",
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        return not any(part in message for part in self.HIDDEN_PARTS)
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
+for handler in logging.getLogger().handlers:
+    handler.addFilter(OptionalVoiceWarningFilter())
+logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
 logger = logging.getLogger("fcl-management")
+
+
+def validate_environment() -> None:
+    if not TOKEN:
+        raise RuntimeError("Не найден DISCORD_TOKEN. Добавь токен в переменные Render.")
+    if GUILD_ID is None:
+        logger.warning("GUILD_ID не указан. Команды будут синхронизированы глобально.")
+    if ROLE_CHANNEL_ID is None:
+        logger.warning("ROLE_CHANNEL_ID не указан. Команды будут доступны во всех каналах.")
+    if LOG_CHANNEL_ID is None:
+        logger.warning("LOG_CHANNEL_ID не указан. Кадровый журнал будет отключён.")
 
 
 class Database:
@@ -61,6 +86,9 @@ class Database:
         self.path = Path(path)
         self.connection = sqlite3.connect(self.path)
         self.connection.row_factory = sqlite3.Row
+        self._create_tables()
+
+    def _create_tables(self) -> None:
         self.connection.execute(
             """
             CREATE TABLE IF NOT EXISTS rank_history (
@@ -78,9 +106,17 @@ class Database:
         )
         self.connection.commit()
 
-    def add_history(self, *, guild_id: int, member_id: int, actor_id: int,
-                    action: str, old_rank: str, new_rank: str,
-                    reason: str | None) -> None:
+    def add_history(
+        self,
+        *,
+        guild_id: int,
+        member_id: int,
+        actor_id: int,
+        action: str,
+        old_rank: str,
+        new_rank: str,
+        reason: str | None,
+    ) -> None:
         self.connection.execute(
             """
             INSERT INTO rank_history (
@@ -89,14 +125,25 @@ class Database:
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                datetime.now(timezone.utc).isoformat(), guild_id, member_id,
-                actor_id, action, old_rank, new_rank, reason,
+                datetime.now(timezone.utc).isoformat(),
+                guild_id,
+                member_id,
+                actor_id,
+                action,
+                old_rank,
+                new_rank,
+                reason,
             ),
         )
         self.connection.commit()
 
-    def get_history(self, *, guild_id: int, member_id: int,
-                    limit: int = 10) -> list[sqlite3.Row]:
+    def get_history(
+        self,
+        *,
+        guild_id: int,
+        member_id: int,
+        limit: int = 10,
+    ) -> list[sqlite3.Row]:
         return self.connection.execute(
             """
             SELECT created_at, actor_id, action, old_rank, new_rank, reason
@@ -118,7 +165,7 @@ class Database:
             """,
             (guild_id, member_id),
         ).fetchall()
-        counters = {row["action"]: row["amount"] for row in rows}
+        counters = {str(row["action"]): int(row["amount"]) for row in rows}
         return (
             sum(counters.values()),
             counters.get("Повышение", 0),
@@ -152,25 +199,29 @@ def get_role(guild: discord.Guild, name: str) -> discord.Role | None:
 
 
 def get_named_roles(member: discord.Member, names: Iterable[str]) -> list[discord.Role]:
-    name_set = set(names)
-    return [role for role in member.roles if role.name in name_set]
+    names_set = set(names)
+    return [role for role in member.roles if role.name in names_set]
 
 
 def ensure_bot_can_manage(guild: discord.Guild, roles: Iterable[discord.Role]) -> None:
     bot_member = guild.me
     if bot_member is None:
-        raise RuntimeError("Не удалось определить роль бота.")
+        raise RuntimeError("Не удалось определить роль бота на сервере.")
     blocked = [role for role in roles if role >= bot_member.top_role]
     if blocked:
         names = ", ".join(f"«{role.name}»" for role in blocked)
         raise PermissionError(
-            f"Бот не может управлять ролями {names}. Подними роль бота выше."
+            f"Бот не может управлять ролями {names}. Подними роль бота выше указанных ролей."
         )
 
 
-async def send_private(interaction: discord.Interaction, content: str,
-                       *, embed: discord.Embed | None = None,
-                       view: discord.ui.View | None = None) -> None:
+async def send_private(
+    interaction: discord.Interaction,
+    content: str | None = None,
+    *,
+    embed: discord.Embed | None = None,
+    view: discord.ui.View | None = None,
+) -> None:
     if interaction.response.is_done():
         await interaction.followup.send(content=content, embed=embed, view=view, ephemeral=True)
     else:
@@ -181,7 +232,7 @@ async def validate_manager(interaction: discord.Interaction) -> discord.Member |
     if interaction.guild is None or not isinstance(interaction.user, discord.Member):
         await send_private(interaction, "Команда доступна только на сервере.")
         return None
-    if ROLE_CHANNEL_ID and interaction.channel_id != ROLE_CHANNEL_ID:
+    if ROLE_CHANNEL_ID is not None and interaction.channel_id != ROLE_CHANNEL_ID:
         await send_private(interaction, "Команда доступна только в закрытом канале управления.")
         return None
     if not has_manager_access(interaction.user):
@@ -190,37 +241,58 @@ async def validate_manager(interaction: discord.Interaction) -> discord.Member |
     return interaction.user
 
 
-async def write_log(*, guild: discord.Guild, title: str, member: discord.Member,
-                    actor: discord.Member, old_rank: str, new_rank: str,
-                    reason: str | None) -> None:
-    if not LOG_CHANNEL_ID:
+async def write_log(
+    *,
+    guild: discord.Guild,
+    title: str,
+    member: discord.Member,
+    actor: discord.Member,
+    old_rank: str,
+    new_rank: str,
+    reason: str | None,
+) -> None:
+    if LOG_CHANNEL_ID is None:
         return
     channel = guild.get_channel(LOG_CHANNEL_ID)
     if not isinstance(channel, discord.TextChannel):
+        logger.warning("Канал журнала не найден или не является текстовым.")
         return
-    embed = discord.Embed(title=title, color=discord.Color.purple(),
-                          timestamp=datetime.now(timezone.utc))
+
+    embed = discord.Embed(title=title, color=discord.Color.purple(), timestamp=datetime.now(timezone.utc))
     embed.add_field(name="Участник", value=member.mention, inline=True)
     embed.add_field(name="Изменил(а)", value=actor.mention, inline=True)
     embed.add_field(name="Изменение", value=f"{old_rank} → **{new_rank}**", inline=False)
     if reason:
         embed.add_field(name="Причина", value=reason, inline=False)
     embed.set_footer(text="The Faceless Ones • кадровый журнал")
-    await channel.send(embed=embed)
+
+    try:
+        await channel.send(embed=embed)
+    except discord.Forbidden:
+        logger.error("Бот не может отправлять сообщения в канал журнала.")
+    except discord.HTTPException as error:
+        logger.error("Не удалось отправить запись в журнал: %s", error)
 
 
 async def notify_member(member: discord.Member, *, title: str, text: str) -> None:
+    embed = discord.Embed(title=title, description=text, color=discord.Color.purple())
+    embed.set_footer(text="The Faceless Ones")
     try:
-        embed = discord.Embed(title=title, description=text, color=discord.Color.purple())
-        embed.set_footer(text="The Faceless Ones")
         await member.send(embed=embed)
-    except (discord.Forbidden, discord.HTTPException):
-        pass
+    except discord.Forbidden:
+        logger.info("Личные сообщения участника %s закрыты.", member.id)
+    except discord.HTTPException as error:
+        logger.warning("Не удалось отправить личное сообщение участнику %s: %s", member.id, error)
 
 
-async def replace_rank(*, member: discord.Member, actor: discord.Member,
-                       new_rank_name: str, action: str,
-                       reason: str | None = None) -> tuple[str, str]:
+async def replace_rank(
+    *,
+    member: discord.Member,
+    actor: discord.Member,
+    new_rank_name: str,
+    action: str,
+    reason: str | None = None,
+) -> tuple[str, str]:
     guild = member.guild
     old_roles = get_named_roles(member, RANK_ROLE_NAMES)
     old_rank = get_current_rank(member)
@@ -228,44 +300,71 @@ async def replace_rank(*, member: discord.Member, actor: discord.Member,
     new_role = get_role(guild, new_rank_name)
     if new_role is None:
         raise LookupError(f"Роль «{new_rank_name}» не найдена на сервере.")
+
     ensure_bot_can_manage(guild, [*old_roles, new_role])
     audit_reason = f"FCL: {action}. Изменил(а): {actor}" + (f". Причина: {reason}" if reason else "")
+
     if old_roles:
         await member.remove_roles(*old_roles, reason=audit_reason)
     await member.add_roles(new_role, reason=audit_reason)
+
     db.add_history(
-        guild_id=guild.id, member_id=member.id, actor_id=actor.id,
-        action=action, old_rank=old_rank_text, new_rank=new_role.name,
+        guild_id=guild.id,
+        member_id=member.id,
+        actor_id=actor.id,
+        action=action,
+        old_rank=old_rank_text,
+        new_rank=new_role.name,
         reason=reason,
     )
     await write_log(
-        guild=guild, title=action, member=member, actor=actor,
-        old_rank=old_rank_text, new_rank=new_role.name, reason=reason,
+        guild=guild,
+        title=action,
+        member=member,
+        actor=actor,
+        old_rank=old_rank_text,
+        new_rank=new_role.name,
+        reason=reason,
     )
     return old_rank_text, new_role.name
 
 
-async def remove_family_roles(*, member: discord.Member, actor: discord.Member,
-                              reason: str) -> tuple[str, str]:
+async def remove_family_roles(
+    *,
+    member: discord.Member,
+    actor: discord.Member,
+    reason: str,
+) -> tuple[str, str]:
     guild = member.guild
     roles = get_named_roles(member, FAMILY_ROLE_NAMES)
     old_rank = get_current_rank(member)
     old_rank_text = old_rank.name if old_rank else "не назначен"
     ensure_bot_can_manage(guild, roles)
+
     if roles:
         await member.remove_roles(
             *roles,
             reason=f"FCL: исключение. Изменил(а): {actor}. Причина: {reason}",
         )
+
     new_rank_text = "исключён из состава"
     db.add_history(
-        guild_id=guild.id, member_id=member.id, actor_id=actor.id,
-        action="Исключение", old_rank=old_rank_text,
-        new_rank=new_rank_text, reason=reason,
+        guild_id=guild.id,
+        member_id=member.id,
+        actor_id=actor.id,
+        action="Исключение",
+        old_rank=old_rank_text,
+        new_rank=new_rank_text,
+        reason=reason,
     )
     await write_log(
-        guild=guild, title="Исключение", member=member, actor=actor,
-        old_rank=old_rank_text, new_rank=new_rank_text, reason=reason,
+        guild=guild,
+        title="Исключение",
+        member=member,
+        actor=actor,
+        old_rank=old_rank_text,
+        new_rank=new_rank_text,
+        reason=reason,
     )
     return old_rank_text, new_rank_text
 
@@ -277,9 +376,10 @@ def history_embed(member: discord.Member, guild: discord.Guild) -> discord.Embed
     if not rows:
         embed.description = "Записей пока нет."
         return embed
+
     lines: list[str] = []
     for row in rows:
-        moment = datetime.fromisoformat(row["created_at"])
+        moment = datetime.fromisoformat(str(row["created_at"]))
         line = (
             f"**{row['action']}** — {row['old_rank']} → {row['new_rank']}\n"
             f"{discord.utils.format_dt(moment, style='d')} • <@{row['actor_id']}>"
@@ -296,21 +396,31 @@ def member_card_embed(member: discord.Member, guild: discord.Guild) -> discord.E
     rank = get_current_rank(member)
     total, promotions, demotions = db.get_stats(guild_id=guild.id, member_id=member.id)
     latest = db.get_history(guild_id=guild.id, member_id=member.id, limit=1)
-    embed = discord.Embed(title="Карточка участника", description=member.mention,
-                          color=discord.Color.purple())
+
+    embed = discord.Embed(
+        title="Карточка участника",
+        description=member.mention,
+        color=discord.Color.purple(),
+    )
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.add_field(name="Текущий ранг", value=f"**{rank.name if rank else 'не назначен'}**", inline=False)
-    embed.add_field(name="На сервере с",
-                    value=discord.utils.format_dt(member.joined_at, style="D") if member.joined_at else "неизвестно",
-                    inline=True)
+    embed.add_field(
+        name="На сервере с",
+        value=discord.utils.format_dt(member.joined_at, style="D") if member.joined_at else "неизвестно",
+        inline=True,
+    )
     embed.add_field(name="Изменений", value=str(total), inline=True)
     embed.add_field(name="Повышений", value=str(promotions), inline=True)
     embed.add_field(name="Понижений", value=str(demotions), inline=True)
+
     if latest:
-        moment = datetime.fromisoformat(latest[0]["created_at"])
+        moment = datetime.fromisoformat(str(latest[0]["created_at"]))
         embed.add_field(
             name="Последнее изменение",
-            value=f"{latest[0]['old_rank']} → **{latest[0]['new_rank']}**\n{discord.utils.format_dt(moment, style='R')}",
+            value=(
+                f"{latest[0]['old_rank']} → **{latest[0]['new_rank']}**\n"
+                f"{discord.utils.format_dt(moment, style='R')}"
+            ),
             inline=False,
         )
     embed.set_footer(text="The Faceless Ones • FCL Management")
@@ -318,15 +428,23 @@ def member_card_embed(member: discord.Member, guild: discord.Guild) -> discord.E
 
 
 class ReasonModal(discord.ui.Modal):
-    def __init__(self, *, title: str, target: discord.Member,
-                 action: str, new_rank_name: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        title: str,
+        target: discord.Member,
+        action: str,
+        new_rank_name: str | None = None,
+    ) -> None:
         super().__init__(title=title)
         self.target = target
         self.action_name = action
         self.new_rank_name = new_rank_name
         self.reason = discord.ui.TextInput(
-            label="Причина", placeholder="Укажи причину решения",
-            required=True, max_length=500,
+            label="Причина",
+            placeholder="Укажи причину решения",
+            required=True,
+            max_length=500,
             style=discord.TextStyle.paragraph,
         )
         self.add_item(self.reason)
@@ -338,7 +456,9 @@ class ReasonModal(discord.ui.Modal):
         try:
             if self.action_name == "Исключение":
                 old_rank, new_rank = await remove_family_roles(
-                    member=self.target, actor=actor, reason=str(self.reason)
+                    member=self.target,
+                    actor=actor,
+                    reason=str(self.reason),
                 )
                 await notify_member(
                     self.target,
@@ -346,23 +466,34 @@ class ReasonModal(discord.ui.Modal):
                     text=f"Твоё участие в **The Faceless Ones** завершено.\n\nПричина: {self.reason}",
                 )
             else:
-                if not self.new_rank_name:
+                if self.new_rank_name is None:
                     raise RuntimeError("Не указан новый ранг.")
                 old_rank, new_rank = await replace_rank(
-                    member=self.target, actor=actor,
+                    member=self.target,
+                    actor=actor,
                     new_rank_name=self.new_rank_name,
-                    action=self.action_name, reason=str(self.reason),
+                    action=self.action_name,
+                    reason=str(self.reason),
                 )
                 await notify_member(
-                    self.target, title=self.action_name,
+                    self.target,
+                    title=self.action_name,
                     text=f"Твой текущий ранг — **«{new_rank}»**.",
                 )
         except (PermissionError, LookupError, RuntimeError) as error:
             await send_private(interaction, str(error))
             return
         except discord.Forbidden:
-            await send_private(interaction, "Discord запретил изменение ролей. Проверь право «Управлять ролями».")
+            await send_private(
+                interaction,
+                "Discord запретил изменение ролей. Проверь право «Управлять ролями» и положение роли бота.",
+            )
             return
+        except discord.HTTPException as error:
+            logger.exception("Ошибка Discord при изменении роли: %s", error)
+            await send_private(interaction, "Discord не смог выполнить изменение роли. Повтори попытку позже.")
+            return
+
         await interaction.response.send_message(
             f"Готово: {self.target.mention}\n**{old_rank} → {new_rank}**",
             ephemeral=True,
@@ -388,8 +519,12 @@ class RankSelect(discord.ui.Select):
             await send_private(interaction, f"У {self.target.mention} уже установлен ранг **«{selected}»**.")
             return
         await interaction.response.send_modal(
-            ReasonModal(title="Назначение ранга", target=self.target,
-                        action="Назначение ранга", new_rank_name=selected)
+            ReasonModal(
+                title="Назначение ранга",
+                target=self.target,
+                action="Назначение ранга",
+                new_rank_name=selected,
+            )
         )
 
 
@@ -407,7 +542,7 @@ class ManagementView(discord.ui.View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return await validate_manager(interaction) is not None
 
-    @discord.ui.button(label="Повысить", emoji="⬆️", style=discord.ButtonStyle.success, row=0)
+    @discord.ui.button(label="Повысить", style=discord.ButtonStyle.success, row=0)
     async def promote(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         index = get_rank_index(self.target)
         if index is None:
@@ -418,11 +553,15 @@ class ManagementView(discord.ui.View):
         else:
             new_rank = RANK_ROLE_NAMES[index + 1]
         await interaction.response.send_modal(
-            ReasonModal(title="Повышение", target=self.target,
-                        action="Повышение", new_rank_name=new_rank)
+            ReasonModal(
+                title="Повышение",
+                target=self.target,
+                action="Повышение",
+                new_rank_name=new_rank,
+            )
         )
 
-    @discord.ui.button(label="Понизить", emoji="⬇️", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="Понизить", style=discord.ButtonStyle.secondary, row=0)
     async def demote(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         index = get_rank_index(self.target)
         if index is None:
@@ -432,28 +571,39 @@ class ManagementView(discord.ui.View):
             await send_private(interaction, "У участника уже самый низкий ранг.")
             return
         await interaction.response.send_modal(
-            ReasonModal(title="Понижение", target=self.target,
-                        action="Понижение", new_rank_name=RANK_ROLE_NAMES[index - 1])
+            ReasonModal(
+                title="Понижение",
+                target=self.target,
+                action="Понижение",
+                new_rank_name=RANK_ROLE_NAMES[index - 1],
+            )
         )
 
-    @discord.ui.button(label="Назначить ранг", emoji="🎖️", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(label="Назначить ранг", style=discord.ButtonStyle.primary, row=0)
     async def assign(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await interaction.response.send_message("Выбери ранг:", view=RankSelectView(self.target), ephemeral=True)
+        await interaction.response.send_message(
+            "Выбери ранг:",
+            view=RankSelectView(self.target),
+            ephemeral=True,
+        )
 
-    @discord.ui.button(label="История", emoji="📋", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="История", style=discord.ButtonStyle.secondary, row=1)
     async def history(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        if interaction.guild:
-            await interaction.response.send_message(embed=history_embed(self.target, interaction.guild), ephemeral=True)
+        if interaction.guild is not None:
+            await interaction.response.send_message(
+                embed=history_embed(self.target, interaction.guild),
+                ephemeral=True,
+            )
 
-    @discord.ui.button(label="Исключить", emoji="✖️", style=discord.ButtonStyle.danger, row=1)
+    @discord.ui.button(label="Исключить", style=discord.ButtonStyle.danger, row=1)
     async def exclude(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_modal(
             ReasonModal(title="Исключение", target=self.target, action="Исключение")
         )
 
-    @discord.ui.button(label="Обновить", emoji="🔄", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="Обновить", style=discord.ButtonStyle.secondary, row=1)
     async def refresh(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        if interaction.guild:
+        if interaction.guild is not None:
             await interaction.response.edit_message(
                 embed=member_card_embed(self.target, interaction.guild),
                 view=ManagementView(self.target),
@@ -487,26 +637,48 @@ class MemberSelectView(discord.ui.View):
         self.add_item(MemberSelect())
 
 
-class FCLBot(commands.Bot):
+class FCLClient(discord.Client):
+    def __init__(self) -> None:
+        intents = discord.Intents.default()
+        intents.guilds = True
+        intents.members = True
+        intents.message_content = False
+        intents.presences = False
+
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
+        self.web_runner: web.AppRunner | None = None
+
     async def setup_hook(self) -> None:
-        if GUILD_ID:
+        if GUILD_ID is not None:
             guild = discord.Object(id=GUILD_ID)
             self.tree.copy_global_to(guild=guild)
             synced = await self.tree.sync(guild=guild)
         else:
             synced = await self.tree.sync()
+
         logger.info("Синхронизировано команд: %s", len(synced))
         self.web_runner = await start_web_server()
 
+    async def close(self) -> None:
+        if self.web_runner is not None:
+            await self.web_runner.cleanup()
+        db.connection.close()
+        await super().close()
 
-intents = discord.Intents.default()
-intents.guilds = True
-intents.members = True
-bot = FCLBot(command_prefix="!", intents=intents)
+
+client = FCLClient()
+tree = client.tree
 
 
 async def health(_: web.Request) -> web.Response:
-    return web.Response(text="FCL Management is online")
+    return web.json_response(
+        {
+            "status": "online",
+            "service": "FCL Management",
+            "discord_ready": client.is_ready(),
+        }
+    )
 
 
 async def start_web_server() -> web.AppRunner:
@@ -521,13 +693,28 @@ async def start_web_server() -> web.AppRunner:
     return runner
 
 
-@bot.event
+@client.event
 async def on_ready() -> None:
-    if bot.user:
-        logger.info("Бот запущен: %s (%s)", bot.user, bot.user.id)
+    if client.user is None:
+        return
+    await client.change_presence(
+        status=discord.Status.online,
+        activity=discord.CustomActivity(name="Управление составом"),
+    )
+    logger.info("Бот запущен: %s (%s)", client.user, client.user.id)
 
 
-@bot.tree.command(name="управление", description="Открыть панель управления составом.")
+@client.event
+async def on_disconnect() -> None:
+    logger.warning("Соединение с Discord временно потеряно.")
+
+
+@client.event
+async def on_resumed() -> None:
+    logger.info("Соединение с Discord восстановлено.")
+
+
+@tree.command(name="управление", description="Открыть панель управления составом.")
 async def management(interaction: discord.Interaction) -> None:
     if await validate_manager(interaction) is None:
         return
@@ -540,27 +727,33 @@ async def management(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(embed=embed, view=MemberSelectView(), ephemeral=True)
 
 
-@bot.tree.command(name="карточка", description="Показать карточку участника.")
+@tree.command(name="карточка", description="Показать карточку участника.")
 @app_commands.describe(участник="Участник семьи")
 async def card(interaction: discord.Interaction, участник: discord.Member) -> None:
     if await validate_manager(interaction) is None or interaction.guild is None:
         return
-    await interaction.response.send_message(embed=member_card_embed(участник, interaction.guild), ephemeral=True)
+    await interaction.response.send_message(
+        embed=member_card_embed(участник, interaction.guild),
+        ephemeral=True,
+    )
 
 
-@bot.tree.command(name="история", description="Показать историю изменений ранга участника.")
+@tree.command(name="история", description="Показать историю изменений ранга участника.")
 @app_commands.describe(участник="Участник семьи")
-async def history(interaction: discord.Interaction, участник: discord.Member) -> None:
+async def history_command(interaction: discord.Interaction, участник: discord.Member) -> None:
     if await validate_manager(interaction) is None or interaction.guild is None:
         return
-    await interaction.response.send_message(embed=history_embed(участник, interaction.guild), ephemeral=True)
+    await interaction.response.send_message(
+        embed=history_embed(участник, interaction.guild),
+        ephemeral=True,
+    )
 
 
-@bot.tree.command(name="состав", description="Показать количество участников по рангам.")
+@tree.command(name="состав", description="Показать количество участников по рангам.")
 async def roster(interaction: discord.Interaction) -> None:
     if await validate_manager(interaction) is None or interaction.guild is None:
         return
-    lines = []
+    lines: list[str] = []
     total = 0
     for role_name in RANK_ROLE_NAMES:
         role = get_role(interaction.guild, role_name)
@@ -577,7 +770,7 @@ async def roster(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="исключить", description="Исключить участника из состава семьи.")
+@tree.command(name="исключить", description="Исключить участника из состава семьи.")
 @app_commands.describe(участник="Участник семьи")
 async def exclude_command(interaction: discord.Interaction, участник: discord.Member) -> None:
     if await validate_manager(interaction) is None:
@@ -587,9 +780,11 @@ async def exclude_command(interaction: discord.Interaction, участник: di
     )
 
 
-@bot.tree.error
-async def command_error(interaction: discord.Interaction,
-                        error: app_commands.AppCommandError) -> None:
+@tree.error
+async def command_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError,
+) -> None:
     logger.exception("Ошибка slash-команды", exc_info=error)
     message = "При выполнении команды произошла ошибка. Проверь настройки ролей и переменные Render."
     if interaction.response.is_done():
@@ -598,7 +793,5 @@ async def command_error(interaction: discord.Interaction,
         await interaction.response.send_message(message, ephemeral=True)
 
 
-if not TOKEN:
-    raise RuntimeError("Не найден DISCORD_TOKEN. Добавь токен в переменные Render.")
-
-bot.run(TOKEN)
+validate_environment()
+client.run(TOKEN)

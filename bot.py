@@ -222,10 +222,21 @@ async def send_private(
     embed: discord.Embed | None = None,
     view: discord.ui.View | None = None,
 ) -> None:
+    payload: dict[str, object] = {
+        "content": content,
+        "ephemeral": True,
+    }
+
+    if embed is not None:
+        payload["embed"] = embed
+
+    if view is not None:
+        payload["view"] = view
+
     if interaction.response.is_done():
-        await interaction.followup.send(content=content, embed=embed, view=view, ephemeral=True)
+        await interaction.followup.send(**payload)
     else:
-        await interaction.response.send_message(content=content, embed=embed, view=view, ephemeral=True)
+        await interaction.response.send_message(**payload)
 
 
 async def validate_manager(interaction: discord.Interaction) -> discord.Member | None:

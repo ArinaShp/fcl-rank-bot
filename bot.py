@@ -18,12 +18,16 @@ TOKEN: Final[str | None] = os.getenv("DISCORD_TOKEN")
 GUILD_ID_RAW: Final[str | None] = os.getenv("GUILD_ID")
 ROLE_CHANNEL_ID_RAW: Final[str | None] = os.getenv("ROLE_CHANNEL_ID")
 LOG_CHANNEL_ID_RAW: Final[str | None] = os.getenv("LOG_CHANNEL_ID")
+ACCESS_LOG_CHANNEL_ID_RAW: Final[str | None] = os.getenv("ACCESS_LOG_CHANNEL_ID")
 PORT: Final[int] = int(os.getenv("PORT", "10000"))
 DATABASE_PATH: Final[str] = os.getenv("DATABASE_PATH", "fcl_management.db")
 
 GUILD_ID: Final[int | None] = int(GUILD_ID_RAW) if GUILD_ID_RAW else None
 ROLE_CHANNEL_ID: Final[int | None] = int(ROLE_CHANNEL_ID_RAW) if ROLE_CHANNEL_ID_RAW else None
 LOG_CHANNEL_ID: Final[int | None] = int(LOG_CHANNEL_ID_RAW) if LOG_CHANNEL_ID_RAW else None
+ACCESS_LOG_CHANNEL_ID: Final[int | None] = (
+    int(ACCESS_LOG_CHANNEL_ID_RAW) if ACCESS_LOG_CHANNEL_ID_RAW else LOG_CHANNEL_ID
+)
 
 MANAGER_ROLE_NAMES: Final[set[str]] = {
     "Владелец",
@@ -47,6 +51,20 @@ RANK_ROLE_NAMES: Final[tuple[str, ...]] = (
 )
 
 FAMILY_ROLE_NAMES: Final[set[str]] = set(RANK_ROLE_NAMES)
+
+ACCESS_ROLE_NAME: Final[str] = "Призванный"
+ACCESS_BUTTON_CUSTOM_ID: Final[str] = "fcl:access:join"
+
+ACCESS_EMBED_TITLE: Final[str] = "ДОПУСК К THE FACELESS ONES"
+ACCESS_EMBED_DESCRIPTION: Final[str] = (
+    "Есть двери, которые не открываются случайным людям.\n\n"
+    "The Faceless Ones принимает тех, чьё слово имеет вес, "
+    "а присутствие не требует лишних доказательств.\n\n"
+    "Здесь ценят сдержанность, верность и уважение к тем, кто стоит рядом.\n\n"
+    "**Семья уже ждёт тех, кто готов идти этим путём. "
+    "Осталось лишь сделать первый шаг.**"
+)
+
 
 
 class OptionalVoiceWarningFilter(logging.Filter):
@@ -76,9 +94,11 @@ def validate_environment() -> None:
     if GUILD_ID is None:
         logger.warning("GUILD_ID не указан. Команды будут синхронизированы глобально.")
     if ROLE_CHANNEL_ID is None:
-        logger.warning("ROLE_CHANNEL_ID не указан. Команды будут доступны во всех каналах.")
+        logger.warning("ROLE_CHANNEL_ID не указан. Команды управления будут доступны во всех каналах.")
     if LOG_CHANNEL_ID is None:
         logger.warning("LOG_CHANNEL_ID не указан. Кадровый журнал будет отключён.")
+    if ACCESS_LOG_CHANNEL_ID is None:
+        logger.warning("ACCESS_LOG_CHANNEL_ID не указан. Журнал допуска будет отключён.")
 
 
 class Database:
@@ -89,7 +109,7 @@ class Database:
         self._create_tables()
 
     def _create_tables(self) -> None:
-        self.connection.execute(
+        self.connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS rank_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -101,7 +121,31 @@ class Database:
                 old_rank TEXT NOT NULL,
                 new_rank TEXT NOT NULL,
                 reason TEXT
-            )
+            );
+
+            CREATE TABLE IF NOT EXISTS member_profiles (
+                guild_id INTEGER NOT NULL,
+                member_id INTEGER NOT NULL,
+                static_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, member_id),
+                UNIQUE (guild_id, static_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS access_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                guild_id INTEGER NOT NULL,
+                member_id INTEGER NOT NULL,
+                static_id TEXT NOT NULL,
+                role_name TEXT NOT NULL,
+                old_nickname TEXT,
+                new_nickname TEXT,
+                dm_sent INTEGER NOT NULL DEFAULT 0,
+                log_sent INTEGER NOT NULL DEFAULT 0
+            );
+
             """
         )
         self.connection.commit()
@@ -172,6 +216,78 @@ class Database:
             counters.get("Понижение", 0),
         )
 
+    def save_profile(self, *, guild_id: int, member_id: int, static_id: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        self.connection.execute(
+            """
+            INSERT INTO member_profiles (
+                guild_id, member_id, static_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id, member_id) DO UPDATE SET
+                static_id = excluded.static_id,
+                updated_at = excluded.updated_at
+            """,
+            (guild_id, member_id, static_id, now, now),
+        )
+        self.connection.commit()
+
+    def get_static_id(self, *, guild_id: int, member_id: int) -> str | None:
+        row = self.connection.execute(
+            """
+            SELECT static_id
+            FROM member_profiles
+            WHERE guild_id = ? AND member_id = ?
+            """,
+            (guild_id, member_id),
+        ).fetchone()
+        return str(row["static_id"]) if row else None
+
+    def find_member_by_static_id(self, *, guild_id: int, static_id: str) -> int | None:
+        row = self.connection.execute(
+            """
+            SELECT member_id
+            FROM member_profiles
+            WHERE guild_id = ? AND static_id = ?
+            """,
+            (guild_id, static_id),
+        ).fetchone()
+        return int(row["member_id"]) if row else None
+
+    def add_access_event(
+        self,
+        *,
+        guild_id: int,
+        member_id: int,
+        static_id: str,
+        role_name: str,
+        old_nickname: str | None,
+        new_nickname: str | None,
+        dm_sent: bool,
+        log_sent: bool,
+    ) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO access_events (
+                created_at, guild_id, member_id, static_id, role_name,
+                old_nickname, new_nickname,
+                dm_sent, log_sent
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.now(timezone.utc).isoformat(),
+                guild_id,
+                member_id,
+                static_id,
+                role_name,
+                old_nickname,
+                new_nickname,
+                int(dm_sent),
+                int(log_sent),
+            ),
+        )
+        self.connection.commit()
+
+
 
 db = Database(DATABASE_PATH)
 
@@ -239,11 +355,19 @@ async def send_private(
         await interaction.response.send_message(**payload)
 
 
-async def validate_manager(interaction: discord.Interaction) -> discord.Member | None:
+async def validate_manager(
+    interaction: discord.Interaction,
+    *,
+    restrict_channel: bool = True,
+) -> discord.Member | None:
     if interaction.guild is None or not isinstance(interaction.user, discord.Member):
         await send_private(interaction, "Команда доступна только на сервере.")
         return None
-    if ROLE_CHANNEL_ID is not None and interaction.channel_id != ROLE_CHANNEL_ID:
+    if (
+        restrict_channel
+        and ROLE_CHANNEL_ID is not None
+        and interaction.channel_id != ROLE_CHANNEL_ID
+    ):
         await send_private(interaction, "Команда доступна только в закрытом канале управления.")
         return None
     if not has_manager_access(interaction.user):
@@ -296,6 +420,99 @@ async def notify_member(member: discord.Member, *, title: str, text: str) -> Non
         logger.warning("Не удалось отправить личное сообщение участнику %s: %s", member.id, error)
 
 
+def build_member_nickname(role_name: str, static_id: str) -> str:
+    nickname = f"{role_name} | {static_id}"
+    return nickname[:32]
+
+
+async def update_member_nickname(
+    member: discord.Member,
+    *,
+    role_name: str,
+    static_id: str,
+    reason: str,
+) -> tuple[str, bool]:
+    nickname = build_member_nickname(role_name, static_id)
+    try:
+        await member.edit(nick=nickname, reason=reason)
+        return nickname, True
+    except (discord.Forbidden, discord.HTTPException):
+        logger.warning("Не удалось изменить никнейм участника %s.", member.id)
+        return nickname, False
+
+
+async def send_access_log(
+    *,
+    member: discord.Member,
+    static_id: str,
+    nickname: str,
+) -> bool:
+    if ACCESS_LOG_CHANNEL_ID is None:
+        return False
+
+    channel = member.guild.get_channel(ACCESS_LOG_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        logger.warning("Канал журнала допуска не найден или не является текстовым.")
+        return False
+
+    embed = discord.Embed(
+        title="НОВЫЙ ДОПУСК",
+        description="Участник подтвердил своё вступление в The Faceless Ones.",
+        color=discord.Color.purple(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Участник", value=member.mention, inline=True)
+    embed.add_field(name="Static ID", value=static_id, inline=True)
+    embed.add_field(name="Стартовый ранг", value=ACCESS_ROLE_NAME, inline=True)
+    embed.add_field(name="Идентификация", value=nickname, inline=False)
+    embed.set_footer(text="The Faceless Ones • журнал допуска")
+
+    try:
+        await channel.send(embed=embed)
+        return True
+    except (discord.Forbidden, discord.HTTPException):
+        logger.warning("Не удалось отправить запись в журнал допуска.")
+        return False
+
+
+async def send_access_dm(
+    *,
+    member: discord.Member,
+    static_id: str,
+) -> bool:
+    identification = build_member_nickname(ACCESS_ROLE_NAME, static_id)
+
+    embed = discord.Embed(
+        title="ДОБРО ПОЖАЛОВАТЬ",
+        description=(
+            "Добро пожаловать в **The Faceless Ones**.\n\n"
+            "Доступ открыт. С этого момента вы становитесь частью семьи, "
+            "где доверие заслуживается поступками, а уважение сохраняется "
+            "верностью своему слову.\n\n"
+            "Теперь перед вами открыт внутренний мир семьи. Осмотритесь, "
+            "познакомьтесь с её порядком и позвольте своему пути начаться."
+        ),
+        color=discord.Color.purple(),
+    )
+    embed.add_field(
+        name="Ваше обозначение",
+        value=identification,
+        inline=False,
+    )
+    embed.set_footer(text="No face. One family. One purpose.")
+
+    try:
+        await member.send(embed=embed)
+        return True
+    except (discord.Forbidden, discord.HTTPException):
+        logger.info(
+            "Не удалось отправить приветствие участнику %s в личные сообщения.",
+            member.id,
+        )
+        return False
+
+
+
 async def replace_rank(
     *,
     member: discord.Member,
@@ -318,6 +535,15 @@ async def replace_rank(
     if old_roles:
         await member.remove_roles(*old_roles, reason=audit_reason)
     await member.add_roles(new_role, reason=audit_reason)
+
+    static_id = db.get_static_id(guild_id=guild.id, member_id=member.id)
+    if static_id:
+        await update_member_nickname(
+            member,
+            role_name=new_role.name,
+            static_id=static_id,
+            reason=f"FCL: обновление никнейма после действия «{action}»",
+        )
 
     db.add_history(
         guild_id=guild.id,
@@ -648,6 +874,186 @@ class MemberSelectView(discord.ui.View):
         self.add_item(MemberSelect())
 
 
+
+
+class AccessStaticIdModal(discord.ui.Modal):
+    def __init__(self) -> None:
+        super().__init__(title="Подтверждение личности")
+        self.static_id = discord.ui.TextInput(
+            label="STATIC ID",
+            placeholder="Укажите Static ID вашего персонажа",
+            required=True,
+            min_length=1,
+            max_length=10,
+        )
+        self.add_item(self.static_id)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await send_private(interaction, "Получение доступа возможно только на сервере.")
+            return
+
+        member = interaction.user
+        static_id = str(self.static_id).strip()
+
+        if not static_id.isdigit():
+            await send_private(interaction, "Static ID должен состоять только из цифр.")
+            return
+
+        existing_member_id = db.find_member_by_static_id(
+            guild_id=interaction.guild.id,
+            static_id=static_id,
+        )
+        if existing_member_id is not None and existing_member_id != member.id:
+            await send_private(
+                interaction,
+                "Этот Static ID уже закреплён за другим участником. Обратитесь к руководству.",
+            )
+            return
+
+        role = get_role(interaction.guild, ACCESS_ROLE_NAME)
+        if role is None:
+            await send_private(
+                interaction,
+                f"Роль «{ACCESS_ROLE_NAME}» не найдена. Обратитесь к руководству.",
+            )
+            return
+
+        existing_rank = get_current_rank(member)
+        if existing_rank is not None:
+            stored_static_id = db.get_static_id(
+                guild_id=interaction.guild.id,
+                member_id=member.id,
+            )
+            details = (
+                f" Ваш Static ID — **{stored_static_id}**."
+                if stored_static_id
+                else ""
+            )
+            await send_private(
+                interaction,
+                f"Доступ уже предоставлен. Ваш текущий ранг — **«{existing_rank.name}»**.{details}",
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        old_nickname = member.nick
+        nickname = build_member_nickname(ACCESS_ROLE_NAME, static_id)
+
+        try:
+            ensure_bot_can_manage(interaction.guild, [role])
+            await member.add_roles(
+                role,
+                reason="Самостоятельное получение доступа через FCL Management",
+            )
+        except PermissionError as error:
+            await interaction.followup.send(str(error), ephemeral=True)
+            return
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "Бот не может выдать роль. Проверьте право «Управлять ролями» "
+                "и положение роли бота.",
+                ephemeral=True,
+            )
+            return
+        except discord.HTTPException:
+            logger.exception("Не удалось выдать роль доступа.")
+            await interaction.followup.send(
+                "Не удалось выдать доступ. Повторите попытку позже.",
+                ephemeral=True,
+            )
+            return
+
+        db.save_profile(
+            guild_id=interaction.guild.id,
+            member_id=member.id,
+            static_id=static_id,
+        )
+
+        _, nickname_changed = await update_member_nickname(
+            member,
+            role_name=ACCESS_ROLE_NAME,
+            static_id=static_id,
+            reason="Оформление участника после получения доступа",
+        )
+
+        db.add_history(
+            guild_id=interaction.guild.id,
+            member_id=member.id,
+            actor_id=member.id,
+            action="Получение доступа",
+            old_rank="не назначен",
+            new_rank=ACCESS_ROLE_NAME,
+            reason=f"Самостоятельное подтверждение доступа. Static ID: {static_id}",
+        )
+
+
+        dm_sent = await send_access_dm(
+            member=member,
+            static_id=static_id,
+        )
+
+        log_sent = await send_access_log(
+            member=member,
+            static_id=static_id,
+            nickname=nickname,
+        )
+
+        db.add_access_event(
+            guild_id=interaction.guild.id,
+            member_id=member.id,
+            static_id=static_id,
+            role_name=ACCESS_ROLE_NAME,
+            old_nickname=old_nickname,
+            new_nickname=nickname if nickname_changed else old_nickname,
+            dm_sent=dm_sent,
+            log_sent=log_sent,
+        )
+
+        result = discord.Embed(
+            title="ДОСТУП ПРЕДОСТАВЛЕН",
+            description=(
+                "Добро пожаловать в **The Faceless Ones**.\n\n"
+                "Доступ открыт. С этого момента вы становитесь частью семьи, "
+                "где доверие заслуживается поступками, а уважение сохраняется "
+                "верностью своему слову.\n\n"
+                "Теперь перед вами открыт внутренний мир семьи. Осмотритесь, "
+                "познакомьтесь с её порядком и позвольте своему пути начаться."
+            ),
+            color=discord.Color.purple(),
+        )
+        result.add_field(
+            name="Ваше обозначение",
+            value=(
+                nickname
+                if nickname_changed
+                else f"{ACCESS_ROLE_NAME} | {static_id}"
+            ),
+            inline=False,
+        )
+        result.set_footer(text="No face. One family. One purpose.")
+
+        await interaction.followup.send(embed=result, ephemeral=True)
+
+
+class AccessButtonView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Получить доступ",
+        style=discord.ButtonStyle.primary,
+        custom_id=ACCESS_BUTTON_CUSTOM_ID,
+    )
+    async def receive_access(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        await interaction.response.send_modal(AccessStaticIdModal())
+
+
 class FCLClient(discord.Client):
     def __init__(self) -> None:
         intents = discord.Intents.default()
@@ -661,6 +1067,8 @@ class FCLClient(discord.Client):
         self.web_runner: web.AppRunner | None = None
 
     async def setup_hook(self) -> None:
+        self.add_view(AccessButtonView())
+
         if GUILD_ID is not None:
             guild = discord.Object(id=GUILD_ID)
             self.tree.copy_global_to(guild=guild)
@@ -723,6 +1131,53 @@ async def on_disconnect() -> None:
 @client.event
 async def on_resumed() -> None:
     logger.info("Соединение с Discord восстановлено.")
+
+
+@tree.command(
+    name="создать-доступ",
+    description="Опубликовать оформленную кнопку получения роли «Призванный».",
+)
+@app_commands.describe(
+    баннер="Изображение для оформления сообщения",
+)
+async def create_access_message(
+    interaction: discord.Interaction,
+    баннер: discord.Attachment | None = None,
+) -> None:
+    if await validate_manager(interaction, restrict_channel=False) is None:
+        return
+
+    if not isinstance(interaction.channel, discord.TextChannel):
+        await send_private(interaction, "Сообщение можно создать только в текстовом канале.")
+        return
+
+    embed = discord.Embed(
+        title=ACCESS_EMBED_TITLE,
+        description=ACCESS_EMBED_DESCRIPTION,
+        color=discord.Color.purple(),
+    )
+    embed.set_footer(text="The Faceless Ones • право быть среди своих")
+
+    if баннер is not None:
+        if баннер.content_type and not баннер.content_type.startswith("image/"):
+            await send_private(interaction, "В качестве баннера необходимо загрузить изображение.")
+            return
+        embed.set_image(url=баннер.url)
+
+    try:
+        await interaction.channel.send(
+            embed=embed,
+            view=AccessButtonView(),
+        )
+    except discord.Forbidden:
+        await send_private(interaction, "Бот не может отправлять сообщения в этот канал.")
+        return
+    except discord.HTTPException:
+        logger.exception("Не удалось создать сообщение доступа.")
+        await send_private(interaction, "Не удалось создать сообщение с кнопкой.")
+        return
+
+    await send_private(interaction, "Сообщение с кнопкой доступа опубликовано.")
 
 
 @tree.command(name="управление", description="Открыть панель управления составом.")

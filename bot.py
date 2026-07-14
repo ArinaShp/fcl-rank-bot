@@ -28,6 +28,10 @@ ANNIVERSARY_CHANNEL_ID_RAW: Final[str | None] = os.getenv("ANNIVERSARY_CHANNEL_I
 HONOR_BOARD_CHANNEL_ID_RAW: Final[str | None] = os.getenv("HONOR_BOARD_CHANNEL_ID")
 LEAVE_ROLE_NAME: Final[str] = os.getenv("LEAVE_ROLE_NAME", "В отпуске")
 VETERAN_ROLE_NAME: Final[str] = os.getenv("VETERAN_ROLE_NAME", "Ветеран")
+PLENIPOTENTIARY_ROLE_NAME: Final[str] = os.getenv(
+    "PLENIPOTENTIARY_ROLE_NAME",
+    "Полномочный Посол",
+)
 PORT: Final[int] = int(os.getenv("PORT", "10000"))
 DATABASE_PATH: Final[str] = os.getenv("DATABASE_PATH", "fcl_management.db")
 
@@ -512,16 +516,6 @@ db.connection.executescript(
         representative TEXT,
         description TEXT,
         UNIQUE (guild_id, name)
-    );
-
-    CREATE TABLE IF NOT EXISTS alliance_operations (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        created_at TEXT NOT NULL,
-        guild_id INTEGER NOT NULL,
-        alliance_name TEXT NOT NULL,
-        title TEXT NOT NULL,
-        result TEXT,
-        participants INTEGER NOT NULL DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS anniversary_events (
@@ -2575,57 +2569,188 @@ async def inactivity_report(
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@tree.command(name="союз", description="Создать или обновить паспорт союзной семьи.")
-@app_commands.describe(название="Название союзной семьи", представитель="Основной представитель", описание="Краткое описание союза")
+@tree.command(
+    name="назначить-посла",
+    description="Назначить лидеру союзной семьи роль «Полномочный Посол».",
+)
+@app_commands.describe(
+    участник="Лидер или официальный глава союзной семьи",
+)
+async def appoint_plenipotentiary(
+    interaction: discord.Interaction,
+    участник: discord.Member,
+) -> None:
+    actor = await validate_manager(interaction)
+    if actor is None or interaction.guild is None:
+        return
+
+    role = get_role(interaction.guild, PLENIPOTENTIARY_ROLE_NAME)
+    if role is None:
+        await send_private(
+            interaction,
+            f"Роль «{PLENIPOTENTIARY_ROLE_NAME}» не найдена на сервере.",
+        )
+        return
+
+    if role in участник.roles:
+        await send_private(
+            interaction,
+            f"{участник.mention} уже обладает ролью "
+            f"**«{PLENIPOTENTIARY_ROLE_NAME}»**.",
+        )
+        return
+
+    try:
+        ensure_bot_can_manage(interaction.guild, [role])
+        await участник.add_roles(
+            role,
+            reason=(
+                f"Назначение полномочным послом. "
+                f"Оформил(а): {actor}"
+            ),
+        )
+    except PermissionError as error:
+        await send_private(interaction, str(error))
+        return
+    except discord.Forbidden:
+        await send_private(
+            interaction,
+            "Бот не может выдать роль. Проверьте право «Управлять ролями» "
+            "и положение роли бота.",
+        )
+        return
+    except discord.HTTPException:
+        logger.exception(
+            "Не удалось выдать роль полномочного посла участнику %s.",
+            участник.id,
+        )
+        await send_private(
+            interaction,
+            "Не удалось назначить полномочного посла.",
+        )
+        return
+
+    if DIPLOMACY_LOG_CHANNEL_ID is not None:
+        channel = interaction.guild.get_channel(DIPLOMACY_LOG_CHANNEL_ID)
+        if isinstance(channel, discord.TextChannel):
+            embed = discord.Embed(
+                title="НАЗНАЧЕН ПОЛНОМОЧНЫЙ ПОСОЛ",
+                description=(
+                    f"{участник.mention} официально назначен представителем "
+                    "союзной семьи в Посольстве The Faceless Ones."
+                ),
+                color=discord.Color.purple(),
+                timestamp=datetime.now(timezone.utc),
+            )
+            embed.add_field(
+                name="Роль",
+                value=PLENIPOTENTIARY_ROLE_NAME,
+                inline=True,
+            )
+            embed.add_field(
+                name="Назначил(а)",
+                value=actor.mention,
+                inline=True,
+            )
+            embed.set_footer(
+                text="The Faceless Ones • журнал дипломатии"
+            )
+            try:
+                await channel.send(embed=embed)
+            except (discord.Forbidden, discord.HTTPException):
+                logger.warning(
+                    "Не удалось опубликовать назначение полномочного посла."
+                )
+
+    await send_private(
+        interaction,
+        f"{участник.mention} назначен полномочным послом.",
+    )
+
+
+@tree.command(
+    name="союз",
+    description="Создать или обновить дипломатический паспорт союзной семьи.",
+)
+@app_commands.describe(
+    название="Название союзной семьи",
+    статус="Текущий статус союза",
+    представитель="Основной представитель союзной семьи",
+    описание="Краткое описание союза",
+)
+@app_commands.choices(
+    статус=[
+        app_commands.Choice(name="Действующий", value="active"),
+        app_commands.Choice(name="Приостановлен", value="paused"),
+        app_commands.Choice(name="Завершён", value="closed"),
+    ]
+)
 async def alliance_passport(
     interaction: discord.Interaction,
     название: str,
-    представитель: str,
+    статус: app_commands.Choice[str],
+    представитель: discord.Member,
     описание: str,
 ) -> None:
     actor = await validate_manager(interaction)
     if actor is None or interaction.guild is None:
         return
+
+    status_labels = {
+        "active": "Действующий",
+        "paused": "Приостановлен",
+        "closed": "Завершён",
+    }
+    status_label = status_labels[статус.value]
+
     db.connection.execute(
         """
-        INSERT INTO alliances (guild_id, name, started_at, status, representative, description)
-        VALUES (?, ?, ?, 'active', ?, ?)
-        ON CONFLICT(guild_id, name) DO UPDATE SET
-            representative = excluded.representative,
-            description = excluded.description,
-            status = 'active'
-        """,
-        (interaction.guild.id, название, utc_now_iso(), представитель, описание),
-    )
-    db.connection.commit()
-    embed = discord.Embed(title=f"СОЮЗ • {название}", description=описание, color=discord.Color.purple())
-    embed.add_field(name="Статус", value="Действующий", inline=True)
-    embed.add_field(name="Представитель", value=представитель, inline=True)
-    embed.set_footer(text="The Faceless Ones • дипломатический паспорт")
-    await interaction.response.send_message(embed=embed)
-
-
-@tree.command(name="совместная-операция", description="Записать совместную операцию с союзной семьёй.")
-@app_commands.describe(союз="Название союзной семьи", название="Название операции", результат="Итог операции", участников="Количество участников")
-async def alliance_operation(
-    interaction: discord.Interaction,
-    союз: str,
-    название: str,
-    результат: str,
-    участников: app_commands.Range[int, 0, 1000],
-) -> None:
-    actor = await validate_manager(interaction)
-    if actor is None or interaction.guild is None:
-        return
-    db.connection.execute(
-        """
-        INSERT INTO alliance_operations (created_at, guild_id, alliance_name, title, result, participants)
+        INSERT INTO alliances (
+            guild_id,
+            name,
+            started_at,
+            status,
+            representative,
+            description
+        )
         VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(guild_id, name) DO UPDATE SET
+            status = excluded.status,
+            representative = excluded.representative,
+            description = excluded.description
         """,
-        (utc_now_iso(), interaction.guild.id, союз, название, результат, int(участников)),
+        (
+            interaction.guild.id,
+            название,
+            utc_now_iso(),
+            статус.value,
+            str(представитель.id),
+            описание,
+        ),
     )
     db.connection.commit()
-    await send_private(interaction, "Совместная операция сохранена.")
+
+    embed = discord.Embed(
+        title=f"СОЮЗ • {название}",
+        description=описание,
+        color=discord.Color.purple(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(
+        name="Статус",
+        value=status_label,
+        inline=True,
+    )
+    embed.add_field(
+        name="Основной представитель",
+        value=представитель.mention,
+        inline=True,
+    )
+    embed.set_footer(
+        text="The Faceless Ones • дипломатический паспорт"
+    )
+
+    await interaction.response.send_message(embed=embed)
 
 
 @tree.command(name="доска-почета", description="Показать участников с наибольшим числом заслуг.")

@@ -19,6 +19,7 @@ GUILD_ID_RAW: Final[str | None] = os.getenv("GUILD_ID")
 ROLE_CHANNEL_ID_RAW: Final[str | None] = os.getenv("ROLE_CHANNEL_ID")
 LOG_CHANNEL_ID_RAW: Final[str | None] = os.getenv("LOG_CHANNEL_ID")
 ACCESS_LOG_CHANNEL_ID_RAW: Final[str | None] = os.getenv("ACCESS_LOG_CHANNEL_ID")
+DIPLOMACY_LOG_CHANNEL_ID_RAW: Final[str | None] = os.getenv("DIPLOMACY_LOG_CHANNEL_ID")
 PORT: Final[int] = int(os.getenv("PORT", "10000"))
 DATABASE_PATH: Final[str] = os.getenv("DATABASE_PATH", "fcl_management.db")
 
@@ -27,6 +28,11 @@ ROLE_CHANNEL_ID: Final[int | None] = int(ROLE_CHANNEL_ID_RAW) if ROLE_CHANNEL_ID
 LOG_CHANNEL_ID: Final[int | None] = int(LOG_CHANNEL_ID_RAW) if LOG_CHANNEL_ID_RAW else None
 ACCESS_LOG_CHANNEL_ID: Final[int | None] = (
     int(ACCESS_LOG_CHANNEL_ID_RAW) if ACCESS_LOG_CHANNEL_ID_RAW else LOG_CHANNEL_ID
+)
+DIPLOMACY_LOG_CHANNEL_ID: Final[int | None] = (
+    int(DIPLOMACY_LOG_CHANNEL_ID_RAW)
+    if DIPLOMACY_LOG_CHANNEL_ID_RAW
+    else ACCESS_LOG_CHANNEL_ID
 )
 
 MANAGER_ROLE_NAMES: Final[set[str]] = {
@@ -66,6 +72,22 @@ ACCESS_EMBED_DESCRIPTION: Final[str] = (
 )
 
 
+ALLIANCE_ROLE_NAME: Final[str] = "Союзник"
+ALLIANCE_BUTTON_CUSTOM_ID: Final[str] = "fcl:alliance:join"
+
+ALLIANCE_EMBED_TITLE: Final[str] = "ДОСТУП К ПОСОЛЬСТВУ"
+ALLIANCE_EMBED_DESCRIPTION: Final[str] = (
+    "Есть союзы, которые заключаются ради выгоды, "
+    "и есть те, что рождаются из взаимного уважения и доверия.\n\n"
+    "The Faceless Ones открывает Посольство только тем, "
+    "чьё слово имеет вес, а поступки подтверждают намерения.\n\n"
+    "Здесь встречаются представители семей, объединённых общей целью "
+    "и готовностью действовать сообща.\n\n"
+    "**Пусть этот союз станет началом крепкого сотрудничества "
+    "и взаимного доверия.**"
+)
+
+
 
 class OptionalVoiceWarningFilter(logging.Filter):
     HIDDEN_PARTS: Final[tuple[str, ...]] = (
@@ -99,6 +121,8 @@ def validate_environment() -> None:
         logger.warning("LOG_CHANNEL_ID не указан. Кадровый журнал будет отключён.")
     if ACCESS_LOG_CHANNEL_ID is None:
         logger.warning("ACCESS_LOG_CHANNEL_ID не указан. Журнал допуска будет отключён.")
+    if DIPLOMACY_LOG_CHANNEL_ID is None:
+        logger.warning("DIPLOMACY_LOG_CHANNEL_ID не указан. Журнал дипломатии будет отключён.")
 
 
 class Database:
@@ -511,6 +535,80 @@ async def send_access_dm(
         )
         return False
 
+
+
+async def send_alliance_log(
+    *,
+    member: discord.Member,
+    static_id: str,
+    nickname: str,
+) -> bool:
+    if DIPLOMACY_LOG_CHANNEL_ID is None:
+        return False
+
+    channel = member.guild.get_channel(DIPLOMACY_LOG_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        logger.warning("Канал журнала дипломатии не найден или не является текстовым.")
+        return False
+
+    embed = discord.Embed(
+        title="НОВЫЙ СОЮЗНИК",
+        description=(
+            "Представителю союзной семьи предоставлен доступ "
+            "к Посольству The Faceless Ones."
+        ),
+        color=discord.Color.purple(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Участник", value=member.mention, inline=True)
+    embed.add_field(name="Static ID", value=static_id, inline=True)
+    embed.add_field(name="Роль", value=ALLIANCE_ROLE_NAME, inline=True)
+    embed.add_field(name="Идентификация", value=nickname, inline=False)
+    embed.set_footer(text="The Faceless Ones • журнал дипломатии")
+
+    try:
+        await channel.send(embed=embed)
+        return True
+    except (discord.Forbidden, discord.HTTPException):
+        logger.warning("Не удалось отправить запись в журнал дипломатии.")
+        return False
+
+
+async def send_alliance_dm(
+    *,
+    member: discord.Member,
+    static_id: str,
+) -> bool:
+    identification = build_member_nickname(ALLIANCE_ROLE_NAME, static_id)
+
+    embed = discord.Embed(
+        title="ДОБРО ПОЖАЛОВАТЬ В ПОСОЛЬСТВО",
+        description=(
+            "Благодарим за принятое приглашение.\\n\\n"
+            "Для вас открыт дипломатический раздел The Faceless Ones — "
+            "пространство, где союзники обмениваются информацией, "
+            "обсуждают совместные инициативы и поддерживают постоянную связь.\\n\\n"
+            "Пусть это сотрудничество станет прочной основой "
+            "для будущих совместных достижений."
+        ),
+        color=discord.Color.purple(),
+    )
+    embed.add_field(
+        name="Ваше обозначение",
+        value=identification,
+        inline=False,
+    )
+    embed.set_footer(text="Trust builds alliances.")
+
+    try:
+        await member.send(embed=embed)
+        return True
+    except (discord.Forbidden, discord.HTTPException):
+        logger.info(
+            "Не удалось отправить дипломатическое приветствие участнику %s.",
+            member.id,
+        )
+        return False
 
 
 async def replace_rank(
@@ -1054,6 +1152,190 @@ class AccessButtonView(discord.ui.View):
         await interaction.response.send_modal(AccessStaticIdModal())
 
 
+class AllianceStaticIdModal(discord.ui.Modal):
+    def __init__(self) -> None:
+        super().__init__(title="Подтверждение личности")
+        self.static_id = discord.ui.TextInput(
+            label="STATIC ID",
+            placeholder="Укажите Static ID вашего персонажа",
+            required=True,
+            min_length=1,
+            max_length=10,
+        )
+        self.add_item(self.static_id)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await send_private(interaction, "Получение доступа возможно только на сервере.")
+            return
+
+        member = interaction.user
+        static_id = str(self.static_id).strip()
+
+        if not static_id.isdigit():
+            await send_private(interaction, "Static ID должен состоять только из цифр.")
+            return
+
+        existing_member_id = db.find_member_by_static_id(
+            guild_id=interaction.guild.id,
+            static_id=static_id,
+        )
+        if existing_member_id is not None and existing_member_id != member.id:
+            await send_private(
+                interaction,
+                "Этот Static ID уже закреплён за другим участником. Обратитесь к руководству.",
+            )
+            return
+
+        alliance_role = get_role(interaction.guild, ALLIANCE_ROLE_NAME)
+        if alliance_role is None:
+            await send_private(
+                interaction,
+                f"Роль «{ALLIANCE_ROLE_NAME}» не найдена. Обратитесь к руководству.",
+            )
+            return
+
+        if alliance_role in member.roles:
+            stored_static_id = db.get_static_id(
+                guild_id=interaction.guild.id,
+                member_id=member.id,
+            )
+            details = (
+                f" Ваш Static ID — **{stored_static_id}**."
+                if stored_static_id
+                else ""
+            )
+            await send_private(
+                interaction,
+                f"Доступ к Посольству уже предоставлен.{details}",
+            )
+            return
+
+        family_rank = get_current_rank(member)
+        if family_rank is not None:
+            await send_private(
+                interaction,
+                "Вы уже состоите в составе The Faceless Ones. "
+                "Союзный допуск для членов семьи не требуется.",
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        old_nickname = member.nick
+        nickname = build_member_nickname(ALLIANCE_ROLE_NAME, static_id)
+
+        try:
+            ensure_bot_can_manage(interaction.guild, [alliance_role])
+            await member.add_roles(
+                alliance_role,
+                reason="Самостоятельное получение доступа к Посольству",
+            )
+        except PermissionError as error:
+            await interaction.followup.send(str(error), ephemeral=True)
+            return
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "Бот не может выдать роль. Проверьте право «Управлять ролями» "
+                "и положение роли бота.",
+                ephemeral=True,
+            )
+            return
+        except discord.HTTPException:
+            logger.exception("Не удалось выдать роль союзника.")
+            await interaction.followup.send(
+                "Не удалось предоставить доступ. Повторите попытку позже.",
+                ephemeral=True,
+            )
+            return
+
+        db.save_profile(
+            guild_id=interaction.guild.id,
+            member_id=member.id,
+            static_id=static_id,
+        )
+
+        _, nickname_changed = await update_member_nickname(
+            member,
+            role_name=ALLIANCE_ROLE_NAME,
+            static_id=static_id,
+            reason="Оформление представителя союзной семьи",
+        )
+
+        db.add_history(
+            guild_id=interaction.guild.id,
+            member_id=member.id,
+            actor_id=member.id,
+            action="Союзный допуск",
+            old_rank="доступ отсутствовал",
+            new_rank=ALLIANCE_ROLE_NAME,
+            reason=f"Самостоятельное подтверждение доступа. Static ID: {static_id}",
+        )
+
+        dm_sent = await send_alliance_dm(
+            member=member,
+            static_id=static_id,
+        )
+
+        log_sent = await send_alliance_log(
+            member=member,
+            static_id=static_id,
+            nickname=nickname,
+        )
+
+        db.add_access_event(
+            guild_id=interaction.guild.id,
+            member_id=member.id,
+            static_id=static_id,
+            role_name=ALLIANCE_ROLE_NAME,
+            old_nickname=old_nickname,
+            new_nickname=nickname if nickname_changed else old_nickname,
+            dm_sent=dm_sent,
+            log_sent=log_sent,
+        )
+
+        result = discord.Embed(
+            title="ДОСТУП ПРЕДОСТАВЛЕН",
+            description=(
+                "Добро пожаловать в **Посольство The Faceless Ones**.\\n\\n"
+                "Для вас открыт дипломатический раздел семьи, "
+                "созданный для союзников и представителей дружественных организаций.\\n\\n"
+                "Пусть наше сотрудничество строится на взаимном уважении, "
+                "доверии и общей цели."
+            ),
+            color=discord.Color.purple(),
+        )
+        result.add_field(
+            name="Ваше обозначение",
+            value=(
+                nickname
+                if nickname_changed
+                else f"{ALLIANCE_ROLE_NAME} | {static_id}"
+            ),
+            inline=False,
+        )
+        result.set_footer(text="Trust builds alliances.")
+
+        await interaction.followup.send(embed=result, ephemeral=True)
+
+
+class AllianceButtonView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Получить доступ",
+        style=discord.ButtonStyle.primary,
+        custom_id=ALLIANCE_BUTTON_CUSTOM_ID,
+    )
+    async def receive_access(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        await interaction.response.send_modal(AllianceStaticIdModal())
+
+
 class FCLClient(discord.Client):
     def __init__(self) -> None:
         intents = discord.Intents.default()
@@ -1068,6 +1350,7 @@ class FCLClient(discord.Client):
 
     async def setup_hook(self) -> None:
         self.add_view(AccessButtonView())
+        self.add_view(AllianceButtonView())
 
         if GUILD_ID is not None:
             guild = discord.Object(id=GUILD_ID)
@@ -1178,6 +1461,56 @@ async def create_access_message(
         return
 
     await send_private(interaction, "Сообщение с кнопкой доступа опубликовано.")
+
+
+@tree.command(
+    name="создать-доступ-посольство",
+    description="Опубликовать кнопку получения роли «Союзник».",
+)
+@app_commands.describe(
+    баннер="Изображение для оформления сообщения",
+)
+async def create_alliance_access_message(
+    interaction: discord.Interaction,
+    баннер: discord.Attachment | None = None,
+) -> None:
+    if await validate_manager(interaction, restrict_channel=False) is None:
+        return
+
+    if not isinstance(interaction.channel, discord.TextChannel):
+        await send_private(interaction, "Сообщение можно создать только в текстовом канале.")
+        return
+
+    embed = discord.Embed(
+        title=ALLIANCE_EMBED_TITLE,
+        description=ALLIANCE_EMBED_DESCRIPTION,
+        color=discord.Color.purple(),
+    )
+    embed.set_footer(text="The Faceless Ones • доверие объединяет")
+
+    if баннер is not None:
+        if баннер.content_type and not баннер.content_type.startswith("image/"):
+            await send_private(interaction, "В качестве баннера необходимо загрузить изображение.")
+            return
+        embed.set_image(url=баннер.url)
+
+    try:
+        await interaction.channel.send(
+            embed=embed,
+            view=AllianceButtonView(),
+        )
+    except discord.Forbidden:
+        await send_private(interaction, "Бот не может отправлять сообщения в этот канал.")
+        return
+    except discord.HTTPException:
+        logger.exception("Не удалось создать сообщение доступа к Посольству.")
+        await send_private(interaction, "Не удалось создать сообщение с кнопкой.")
+        return
+
+    await send_private(
+        interaction,
+        "Сообщение с кнопкой доступа к Посольству опубликовано.",
+    )
 
 
 @tree.command(name="управление", description="Открыть панель управления составом.")

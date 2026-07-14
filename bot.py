@@ -27,6 +27,7 @@ ANNOUNCEMENT_CHANNEL_ID_RAW: Final[str | None] = os.getenv("ANNOUNCEMENT_CHANNEL
 ANNIVERSARY_CHANNEL_ID_RAW: Final[str | None] = os.getenv("ANNIVERSARY_CHANNEL_ID")
 HONOR_BOARD_CHANNEL_ID_RAW: Final[str | None] = os.getenv("HONOR_BOARD_CHANNEL_ID")
 LEAVE_ROLE_NAME: Final[str] = os.getenv("LEAVE_ROLE_NAME", "В отпуске")
+VETERAN_ROLE_NAME: Final[str] = os.getenv("VETERAN_ROLE_NAME", "Ветеран")
 PORT: Final[int] = int(os.getenv("PORT", "10000"))
 DATABASE_PATH: Final[str] = os.getenv("DATABASE_PATH", "fcl_management.db")
 
@@ -108,6 +109,108 @@ ALLIANCE_EMBED_DESCRIPTION: Final[str] = (
     "**Пусть этот союз станет началом крепкого сотрудничества "
     "и взаимного доверия.**"
 )
+
+
+AUTOMATIC_ACHIEVEMENTS: Final[dict[str, dict[str, object]]] = {
+    "Первый шаг": {
+        "description": (
+            "За принятие своего места среди The Faceless Ones "
+            "и начало пути внутри семьи."
+        ),
+        "points": 0,
+    },
+    "Ветеран семьи": {
+        "description": (
+            "За полгода рядом с The Faceless Ones, верность общему пути "
+            "и вклад в историю семьи."
+        ),
+        "points": 3,
+    },
+}
+
+MANUAL_ACHIEVEMENTS: Final[dict[str, dict[str, object]]] = {
+    "Знак доверия": {
+        "description": (
+            "За надёжность, верность своему слову и поступки, "
+            "укрепляющие доверие внутри семьи."
+        ),
+        "points": 2,
+    },
+    "Опора семьи": {
+        "description": (
+            "За постоянную поддержку участников, готовность прийти на помощь "
+            "и вклад в сохранение единства The Faceless Ones."
+        ),
+        "points": 2,
+    },
+    "Безупречная служба": {
+        "description": (
+            "За ответственность, стабильность и безупречное исполнение "
+            "возложенных обязанностей."
+        ),
+        "points": 2,
+    },
+    "След в истории": {
+        "description": (
+            "За вклад, ставший значимой частью истории "
+            "и развития The Faceless Ones."
+        ),
+        "points": 3,
+    },
+    "Участник операции": {
+        "description": (
+            "За достойное участие в значимом мероприятии "
+            "и вклад в достижение общей цели."
+        ),
+        "points": 1,
+    },
+    "Ключевой участник": {
+        "description": (
+            "За решающий вклад в подготовку или проведение важного события."
+        ),
+        "points": 3,
+    },
+    "Организатор": {
+        "description": (
+            "За инициативу, ответственность и высокий уровень "
+            "организации семейного мероприятия."
+        ),
+        "points": 1,
+    },
+    "Наставник": {
+        "description": (
+            "За помощь новым участникам, передачу опыта "
+            "и поддержку на первых этапах их пути."
+        ),
+        "points": 1,
+    },
+    "Хранитель традиций": {
+        "description": (
+            "За сохранение внутреннего порядка, ценностей "
+            "и традиций The Faceless Ones."
+        ),
+        "points": 3,
+    },
+    "Голос союза": {
+        "description": (
+            "За достойное представление интересов The Faceless Ones "
+            "и вклад в развитие дипломатических отношений."
+        ),
+        "points": 2,
+    },
+    "Укрепление союза": {
+        "description": (
+            "За действия, укрепившие взаимное доверие "
+            "и сотрудничество между семьями."
+        ),
+        "points": 2,
+    },
+}
+
+ACHIEVEMENT_CHOICES: Final[list[app_commands.Choice[str]]] = [
+    app_commands.Choice(name=name, value=name)
+    for name in MANUAL_ACHIEVEMENTS
+]
 
 
 
@@ -431,6 +534,19 @@ db.connection.executescript(
     """
 )
 db.connection.commit()
+
+achievement_columns = {
+    str(row["name"])
+    for row in db.connection.execute(
+        "PRAGMA table_info(achievements)"
+    ).fetchall()
+}
+if "points" not in achievement_columns:
+    db.connection.execute(
+        "ALTER TABLE achievements "
+        "ADD COLUMN points INTEGER NOT NULL DEFAULT 1"
+    )
+    db.connection.commit()
 
 
 def has_manager_access(member: discord.Member) -> bool:
@@ -1217,6 +1333,176 @@ class ChronicleModal(discord.ui.Modal):
         await send_private(interaction, "Запись добавлена в хронику.")
 
 
+def has_achievement(
+    *,
+    guild_id: int,
+    member_id: int,
+    title: str,
+) -> bool:
+    row = db.connection.execute(
+        """
+        SELECT 1
+        FROM achievements
+        WHERE guild_id = ? AND member_id = ? AND title = ?
+        LIMIT 1
+        """,
+        (guild_id, member_id, title),
+    ).fetchone()
+    return row is not None
+
+
+async def publish_achievement(
+    *,
+    member: discord.Member,
+    title: str,
+    description: str,
+) -> bool:
+    if HONOR_BOARD_CHANNEL_ID is None:
+        logger.warning(
+            "HONOR_BOARD_CHANNEL_ID не указан. "
+            "Достижение «%s» не опубликовано.",
+            title,
+        )
+        return False
+
+    channel = member.guild.get_channel(HONOR_BOARD_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        logger.warning(
+            "Канал доски почёта не найден или не является текстовым."
+        )
+        return False
+
+    embed = discord.Embed(
+        title="ДОСТИЖЕНИЕ ПОЛУЧЕНО",
+        description=f"**{title.upper()}**\n\n{description}",
+        color=discord.Color.purple(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(
+        name="Получатель",
+        value=member.mention,
+        inline=False,
+    )
+    embed.set_footer(
+        text="Запись внесена в архив достижений The Faceless Ones."
+    )
+
+    try:
+        await channel.send(embed=embed)
+        return True
+    except (discord.Forbidden, discord.HTTPException):
+        logger.warning(
+            "Не удалось опубликовать достижение «%s».",
+            title,
+        )
+        return False
+
+
+async def grant_achievement(
+    *,
+    member: discord.Member,
+    actor_id: int,
+    title: str,
+    description: str,
+    points: int,
+    publish: bool = True,
+) -> bool:
+    if has_achievement(
+        guild_id=member.guild.id,
+        member_id=member.id,
+        title=title,
+    ):
+        return False
+
+    db.connection.execute(
+        """
+        INSERT INTO achievements (
+            created_at,
+            guild_id,
+            member_id,
+            actor_id,
+            title,
+            description,
+            points
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            utc_now_iso(),
+            member.guild.id,
+            member.id,
+            actor_id,
+            title,
+            description,
+            points,
+        ),
+    )
+    db.connection.commit()
+
+    if publish:
+        await publish_achievement(
+            member=member,
+            title=title,
+            description=description,
+        )
+
+    return True
+
+
+async def grant_first_step(member: discord.Member) -> bool:
+    data = AUTOMATIC_ACHIEVEMENTS["Первый шаг"]
+    return await grant_achievement(
+        member=member,
+        actor_id=member.id,
+        title="Первый шаг",
+        description=str(data["description"]),
+        points=int(data["points"]),
+        publish=True,
+    )
+
+
+async def grant_veteran_achievement(member: discord.Member) -> bool:
+    data = AUTOMATIC_ACHIEVEMENTS["Ветеран семьи"]
+
+    granted = await grant_achievement(
+        member=member,
+        actor_id=client.user.id if client.user else member.id,
+        title="Ветеран семьи",
+        description=str(data["description"]),
+        points=int(data["points"]),
+        publish=True,
+    )
+
+    if not granted:
+        return False
+
+    role = get_role(member.guild, VETERAN_ROLE_NAME)
+    if role is None:
+        logger.warning(
+            "Роль «%s» не найдена. Достижение выдано без роли.",
+            VETERAN_ROLE_NAME,
+        )
+        return True
+
+    try:
+        ensure_bot_can_manage(member.guild, [role])
+        if role not in member.roles:
+            await member.add_roles(
+                role,
+                reason=(
+                    "Автоматическое присвоение статуса ветерана "
+                    "за 180 дней в семье"
+                ),
+            )
+    except (PermissionError, discord.Forbidden, discord.HTTPException):
+        logger.exception(
+            "Не удалось выдать роль ветерана участнику %s.",
+            member.id,
+        )
+
+    return True
+
+
 class ReasonModal(discord.ui.Modal):
     def __init__(
         self,
@@ -1547,6 +1833,7 @@ class AccessStaticIdModal(discord.ui.Modal):
             reason=f"Самостоятельное подтверждение доступа. Static ID: {static_id}",
         )
 
+        await grant_first_step(member)
 
         dm_sent = False
 
@@ -1975,7 +2262,12 @@ async def anniversary_watcher() -> None:
         if member is None:
             continue
 
-        if milestone < 365:
+        if milestone == 180:
+            await grant_veteran_achievement(member)
+
+        if milestone == 180:
+            period = "полгода"
+        elif milestone < 365:
             period = f"{milestone} дней"
         else:
             years = milestone // 365
@@ -2196,26 +2488,54 @@ async def assign_mentor(
     await send_private(interaction, f"{наставник.mention} назначен наставником для {участник.mention}.")
 
 
-@tree.command(name="достижение", description="Добавить достижение в личное дело.")
-@app_commands.describe(участник="Участник", название="Название достижения", описание="Описание достижения")
+@tree.command(
+    name="достижение",
+    description="Присвоить достижение из утверждённого списка.",
+)
+@app_commands.describe(
+    участник="Участник семьи",
+    достижение="Выберите достижение",
+)
+@app_commands.choices(достижение=ACHIEVEMENT_CHOICES)
 async def add_achievement(
     interaction: discord.Interaction,
     участник: discord.Member,
-    название: str,
-    описание: str,
+    достижение: app_commands.Choice[str],
 ) -> None:
     actor = await validate_manager(interaction)
     if actor is None or interaction.guild is None:
         return
-    db.connection.execute(
-        """
-        INSERT INTO achievements (created_at, guild_id, member_id, actor_id, title, description)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (utc_now_iso(), interaction.guild.id, участник.id, actor.id, название, описание),
+
+    data = MANUAL_ACHIEVEMENTS.get(достижение.value)
+    if data is None:
+        await send_private(
+            interaction,
+            "Выбранное достижение не найдено.",
+        )
+        return
+
+    granted = await grant_achievement(
+        member=участник,
+        actor_id=actor.id,
+        title=достижение.value,
+        description=str(data["description"]),
+        points=int(data["points"]),
+        publish=True,
     )
-    db.connection.commit()
-    await send_private(interaction, "Достижение добавлено в личное дело.")
+
+    if not granted:
+        await send_private(
+            interaction,
+            f"У {участник.mention} уже есть достижение "
+            f"**«{достижение.value}»**.",
+        )
+        return
+
+    await send_private(
+        interaction,
+        f"Достижение **«{достижение.value}»** "
+        f"присвоено {участник.mention}.",
+    )
 
 
 @tree.command(name="хроника", description="Добавить новое событие в хронику семьи.")
@@ -2321,7 +2641,7 @@ async def honor_board(interaction: discord.Interaction) -> None:
             WHERE guild_id = ? AND event_type = 'reward'
             GROUP BY member_id
             UNION ALL
-            SELECT member_id, COUNT(*) * 2 AS points
+            SELECT member_id, COALESCE(SUM(points), 0) AS points
             FROM achievements
             WHERE guild_id = ?
             GROUP BY member_id

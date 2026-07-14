@@ -3,13 +3,14 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Final, Iterable
 
 import discord
 from aiohttp import web
 from discord import app_commands
+from discord.ext import tasks
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -20,6 +21,12 @@ ROLE_CHANNEL_ID_RAW: Final[str | None] = os.getenv("ROLE_CHANNEL_ID")
 LOG_CHANNEL_ID_RAW: Final[str | None] = os.getenv("LOG_CHANNEL_ID")
 ACCESS_LOG_CHANNEL_ID_RAW: Final[str | None] = os.getenv("ACCESS_LOG_CHANNEL_ID")
 DIPLOMACY_LOG_CHANNEL_ID_RAW: Final[str | None] = os.getenv("DIPLOMACY_LOG_CHANNEL_ID")
+WEEKLY_REPORT_CHANNEL_ID_RAW: Final[str | None] = os.getenv("WEEKLY_REPORT_CHANNEL_ID")
+CHRONICLE_CHANNEL_ID_RAW: Final[str | None] = os.getenv("CHRONICLE_CHANNEL_ID")
+ANNOUNCEMENT_CHANNEL_ID_RAW: Final[str | None] = os.getenv("ANNOUNCEMENT_CHANNEL_ID")
+ANNIVERSARY_CHANNEL_ID_RAW: Final[str | None] = os.getenv("ANNIVERSARY_CHANNEL_ID")
+HONOR_BOARD_CHANNEL_ID_RAW: Final[str | None] = os.getenv("HONOR_BOARD_CHANNEL_ID")
+LEAVE_ROLE_NAME: Final[str] = os.getenv("LEAVE_ROLE_NAME", "В отпуске")
 PORT: Final[int] = int(os.getenv("PORT", "10000"))
 DATABASE_PATH: Final[str] = os.getenv("DATABASE_PATH", "fcl_management.db")
 
@@ -33,6 +40,21 @@ DIPLOMACY_LOG_CHANNEL_ID: Final[int | None] = (
     int(DIPLOMACY_LOG_CHANNEL_ID_RAW)
     if DIPLOMACY_LOG_CHANNEL_ID_RAW
     else ACCESS_LOG_CHANNEL_ID
+)
+WEEKLY_REPORT_CHANNEL_ID: Final[int | None] = (
+    int(WEEKLY_REPORT_CHANNEL_ID_RAW) if WEEKLY_REPORT_CHANNEL_ID_RAW else None
+)
+CHRONICLE_CHANNEL_ID: Final[int | None] = (
+    int(CHRONICLE_CHANNEL_ID_RAW) if CHRONICLE_CHANNEL_ID_RAW else None
+)
+ANNOUNCEMENT_CHANNEL_ID: Final[int | None] = (
+    int(ANNOUNCEMENT_CHANNEL_ID_RAW) if ANNOUNCEMENT_CHANNEL_ID_RAW else None
+)
+ANNIVERSARY_CHANNEL_ID: Final[int | None] = (
+    int(ANNIVERSARY_CHANNEL_ID_RAW) if ANNIVERSARY_CHANNEL_ID_RAW else None
+)
+HONOR_BOARD_CHANNEL_ID: Final[int | None] = (
+    int(HONOR_BOARD_CHANNEL_ID_RAW) if HONOR_BOARD_CHANNEL_ID_RAW else None
 )
 
 MANAGER_ROLE_NAMES: Final[set[str]] = {
@@ -314,6 +336,101 @@ class Database:
 
 
 db = Database(DATABASE_PATH)
+
+db.connection.executescript(
+    """
+    CREATE TABLE IF NOT EXISTS personnel_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        guild_id INTEGER NOT NULL,
+        member_id INTEGER NOT NULL,
+        actor_id INTEGER NOT NULL,
+        event_type TEXT NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT,
+        expires_at TEXT,
+        status TEXT NOT NULL DEFAULT 'active'
+    );
+
+    CREATE TABLE IF NOT EXISTS leaves (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        guild_id INTEGER NOT NULL,
+        member_id INTEGER NOT NULL,
+        actor_id INTEGER NOT NULL,
+        starts_at TEXT NOT NULL,
+        ends_at TEXT NOT NULL,
+        reason TEXT,
+        status TEXT NOT NULL DEFAULT 'active'
+    );
+
+    CREATE TABLE IF NOT EXISTS activity_log (
+        guild_id INTEGER NOT NULL,
+        member_id INTEGER NOT NULL,
+        last_activity_at TEXT NOT NULL,
+        source TEXT NOT NULL,
+        PRIMARY KEY (guild_id, member_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS mentorships (
+        guild_id INTEGER NOT NULL,
+        mentee_id INTEGER NOT NULL,
+        mentor_id INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active',
+        PRIMARY KEY (guild_id, mentee_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS achievements (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        guild_id INTEGER NOT NULL,
+        member_id INTEGER NOT NULL,
+        actor_id INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS chronicle (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        guild_id INTEGER NOT NULL,
+        actor_id INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS alliances (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active',
+        representative TEXT,
+        description TEXT,
+        UNIQUE (guild_id, name)
+    );
+
+    CREATE TABLE IF NOT EXISTS alliance_operations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        guild_id INTEGER NOT NULL,
+        alliance_name TEXT NOT NULL,
+        title TEXT NOT NULL,
+        result TEXT,
+        participants INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS anniversary_events (
+        guild_id INTEGER NOT NULL,
+        member_id INTEGER NOT NULL,
+        milestone_days INTEGER NOT NULL,
+        announced_at TEXT NOT NULL,
+        PRIMARY KEY (guild_id, member_id, milestone_days)
+    );
+    """
+)
+db.connection.commit()
 
 
 def has_manager_access(member: discord.Member) -> bool:
@@ -611,6 +728,41 @@ async def send_alliance_dm(
         return False
 
 
+async def publish_rank_announcement(
+    *,
+    member: discord.Member,
+    old_rank: str,
+    new_rank: str,
+    action: str,
+) -> None:
+    if ANNOUNCEMENT_CHANNEL_ID is None:
+        return
+    if action not in {"Повышение", "Назначение ранга"}:
+        return
+
+    channel = member.guild.get_channel(ANNOUNCEMENT_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        return
+
+    embed = discord.Embed(
+        title="НОВОЕ НАЗНАЧЕНИЕ",
+        description=(
+            f"Решением руководства {member.mention} занимает новое место "
+            "в структуре The Faceless Ones."
+        ),
+        color=discord.Color.purple(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Предыдущий ранг", value=old_rank, inline=True)
+    embed.add_field(name="Новый ранг", value=f"**{new_rank}**", inline=True)
+    embed.set_footer(text="The Faceless Ones • путь продолжается")
+
+    try:
+        await channel.send(embed=embed)
+    except (discord.Forbidden, discord.HTTPException):
+        logger.warning("Не удалось опубликовать объявление о назначении.")
+
+
 async def replace_rank(
     *,
     member: discord.Member,
@@ -660,6 +812,12 @@ async def replace_rank(
         old_rank=old_rank_text,
         new_rank=new_role.name,
         reason=reason,
+    )
+    await publish_rank_announcement(
+        member=member,
+        old_rank=old_rank_text,
+        new_rank=new_role.name,
+        action=action,
     )
     return old_rank_text, new_role.name
 
@@ -758,8 +916,305 @@ def member_card_embed(member: discord.Member, guild: discord.Guild) -> discord.E
             ),
             inline=False,
         )
+    personnel = get_personnel_counts(guild.id, member.id)
+    mentor_id = get_mentor(guild.id, member.id)
+    active_leave = get_active_leave(guild.id, member.id)
+
+    embed.add_field(name="Поощрения", value=str(personnel.get("reward", 0)), inline=True)
+    embed.add_field(name="Взыскания", value=str(personnel.get("discipline", 0)), inline=True)
+    embed.add_field(name="Достижения", value=str(count_achievements(guild.id, member.id)), inline=True)
+    embed.add_field(
+        name="Наставник",
+        value=f"<@{mentor_id}>" if mentor_id else "не назначен",
+        inline=False,
+    )
+    if active_leave:
+        leave_end = datetime.fromisoformat(str(active_leave["ends_at"]))
+        embed.add_field(name="Отпуск", value=f"до {leave_end.strftime('%d.%m.%Y')}", inline=False)
+
     embed.set_footer(text="The Faceless Ones • FCL Management")
     return embed
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def record_activity(member: discord.Member, source: str) -> None:
+    db.connection.execute(
+        """
+        INSERT INTO activity_log (guild_id, member_id, last_activity_at, source)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(guild_id, member_id) DO UPDATE SET
+            last_activity_at = excluded.last_activity_at,
+            source = excluded.source
+        """,
+        (member.guild.id, member.id, utc_now_iso(), source),
+    )
+    db.connection.commit()
+
+
+def add_personnel_event(
+    *,
+    guild_id: int,
+    member_id: int,
+    actor_id: int,
+    event_type: str,
+    title: str,
+    description: str | None,
+    expires_at: str | None = None,
+) -> None:
+    db.connection.execute(
+        """
+        INSERT INTO personnel_events (
+            created_at, guild_id, member_id, actor_id,
+            event_type, title, description, expires_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (utc_now_iso(), guild_id, member_id, actor_id, event_type, title, description, expires_at),
+    )
+    db.connection.commit()
+
+
+def get_personnel_counts(guild_id: int, member_id: int) -> dict[str, int]:
+    rows = db.connection.execute(
+        """
+        SELECT event_type, COUNT(*) AS amount
+        FROM personnel_events
+        WHERE guild_id = ? AND member_id = ? AND status = 'active'
+        GROUP BY event_type
+        """,
+        (guild_id, member_id),
+    ).fetchall()
+    return {str(row["event_type"]): int(row["amount"]) for row in rows}
+
+
+def get_active_leave(guild_id: int, member_id: int) -> sqlite3.Row | None:
+    return db.connection.execute(
+        """
+        SELECT starts_at, ends_at, reason
+        FROM leaves
+        WHERE guild_id = ? AND member_id = ? AND status = 'active'
+        ORDER BY id DESC LIMIT 1
+        """,
+        (guild_id, member_id),
+    ).fetchone()
+
+
+def get_mentor(guild_id: int, member_id: int) -> int | None:
+    row = db.connection.execute(
+        """
+        SELECT mentor_id FROM mentorships
+        WHERE guild_id = ? AND mentee_id = ? AND status = 'active'
+        """,
+        (guild_id, member_id),
+    ).fetchone()
+    return int(row["mentor_id"]) if row else None
+
+
+def count_achievements(guild_id: int, member_id: int) -> int:
+    row = db.connection.execute(
+        "SELECT COUNT(*) AS amount FROM achievements WHERE guild_id = ? AND member_id = ?",
+        (guild_id, member_id),
+    ).fetchone()
+    return int(row["amount"]) if row else 0
+
+
+async def send_personnel_log(
+    *,
+    guild: discord.Guild,
+    title: str,
+    description: str,
+    member: discord.Member,
+    actor: discord.Member,
+) -> None:
+    if LOG_CHANNEL_ID is None:
+        return
+    channel = guild.get_channel(LOG_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        return
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        color=discord.Color.purple(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Участник", value=member.mention, inline=True)
+    embed.add_field(name="Оформил(а)", value=actor.mention, inline=True)
+    embed.set_footer(text="The Faceless Ones • личное дело")
+    try:
+        await channel.send(embed=embed)
+    except (discord.Forbidden, discord.HTTPException):
+        logger.warning("Не удалось отправить кадровую запись.")
+
+
+def parse_date(value: str) -> datetime:
+    return datetime.strptime(value.strip(), "%d.%m.%Y").replace(tzinfo=timezone.utc)
+
+
+class PersonnelEventModal(discord.ui.Modal):
+    def __init__(self, *, target: discord.Member, event_type: str, title: str) -> None:
+        super().__init__(title=title)
+        self.target = target
+        self.event_type = event_type
+        self.event_title = discord.ui.TextInput(
+            label="Наименование",
+            placeholder="Краткое наименование записи",
+            max_length=100,
+        )
+        self.description = discord.ui.TextInput(
+            label="Основание",
+            placeholder="Опишите причину или заслугу",
+            style=discord.TextStyle.paragraph,
+            max_length=700,
+        )
+        self.add_item(self.event_title)
+        self.add_item(self.description)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        actor = await validate_manager(interaction)
+        if actor is None:
+            return
+        add_personnel_event(
+            guild_id=self.target.guild.id,
+            member_id=self.target.id,
+            actor_id=actor.id,
+            event_type=self.event_type,
+            title=str(self.event_title),
+            description=str(self.description),
+        )
+        await send_personnel_log(
+            guild=self.target.guild,
+            title=str(self.event_title),
+            description=str(self.description),
+            member=self.target,
+            actor=actor,
+        )
+        await send_private(interaction, "Запись добавлена в личное дело.")
+
+
+class LeaveModal(discord.ui.Modal):
+    def __init__(self, *, target: discord.Member) -> None:
+        super().__init__(title="Оформление отпуска")
+        self.target = target
+        self.end_date = discord.ui.TextInput(
+            label="Дата окончания",
+            placeholder="ДД.ММ.ГГГГ",
+            max_length=10,
+        )
+        self.reason = discord.ui.TextInput(
+            label="Причина",
+            placeholder="Кратко укажите причину",
+            style=discord.TextStyle.paragraph,
+            max_length=500,
+        )
+        self.add_item(self.end_date)
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        actor = await validate_manager(interaction)
+        if actor is None:
+            return
+        try:
+            end = parse_date(str(self.end_date))
+        except ValueError:
+            await send_private(interaction, "Дата должна быть указана в формате ДД.ММ.ГГГГ.")
+            return
+        if end <= datetime.now(timezone.utc):
+            await send_private(interaction, "Дата окончания должна быть позднее текущей даты.")
+            return
+
+        role = get_role(self.target.guild, LEAVE_ROLE_NAME)
+        if role is None:
+            await send_private(interaction, f"Роль «{LEAVE_ROLE_NAME}» не найдена на сервере.")
+            return
+        try:
+            ensure_bot_can_manage(self.target.guild, [role])
+            await self.target.add_roles(role, reason=f"Отпуск до {end.date()}")
+        except (PermissionError, discord.Forbidden, discord.HTTPException) as error:
+            await send_private(interaction, str(error))
+            return
+
+        db.connection.execute(
+            "UPDATE leaves SET status = 'closed' WHERE guild_id = ? AND member_id = ? AND status = 'active'",
+            (self.target.guild.id, self.target.id),
+        )
+        db.connection.execute(
+            """
+            INSERT INTO leaves (
+                created_at, guild_id, member_id, actor_id,
+                starts_at, ends_at, reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                utc_now_iso(), self.target.guild.id, self.target.id, actor.id,
+                utc_now_iso(), end.isoformat(), str(self.reason),
+            ),
+        )
+        db.connection.commit()
+
+        add_personnel_event(
+            guild_id=self.target.guild.id,
+            member_id=self.target.id,
+            actor_id=actor.id,
+            event_type="leave",
+            title="Отпуск",
+            description=str(self.reason),
+            expires_at=end.isoformat(),
+        )
+        await send_personnel_log(
+            guild=self.target.guild,
+            title="ОТПУСК ОФОРМЛЕН",
+            description=f"До {end.strftime('%d.%m.%Y')}\n\n{self.reason}",
+            member=self.target,
+            actor=actor,
+        )
+        await send_private(interaction, "Отпуск оформлен.")
+
+
+class ChronicleModal(discord.ui.Modal):
+    def __init__(self) -> None:
+        super().__init__(title="Новая запись в хронике")
+        self.entry_title = discord.ui.TextInput(
+            label="Событие",
+            placeholder="Название события",
+            max_length=120,
+        )
+        self.description = discord.ui.TextInput(
+            label="Описание",
+            placeholder="Опишите событие",
+            style=discord.TextStyle.paragraph,
+            max_length=1000,
+        )
+        self.add_item(self.entry_title)
+        self.add_item(self.description)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        actor = await validate_manager(interaction)
+        if actor is None or interaction.guild is None:
+            return
+
+        db.connection.execute(
+            """
+            INSERT INTO chronicle (created_at, guild_id, actor_id, title, description)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (utc_now_iso(), interaction.guild.id, actor.id, str(self.entry_title), str(self.description)),
+        )
+        db.connection.commit()
+
+        if CHRONICLE_CHANNEL_ID:
+            channel = interaction.guild.get_channel(CHRONICLE_CHANNEL_ID)
+            if isinstance(channel, discord.TextChannel):
+                embed = discord.Embed(
+                    title=str(self.entry_title),
+                    description=str(self.description),
+                    color=discord.Color.purple(),
+                    timestamp=datetime.now(timezone.utc),
+                )
+                embed.set_footer(text="Хроника The Faceless Ones")
+                await channel.send(embed=embed)
+        await send_private(interaction, "Запись добавлена в хронику.")
 
 
 class ReasonModal(discord.ui.Modal):
@@ -795,11 +1250,6 @@ class ReasonModal(discord.ui.Modal):
                     actor=actor,
                     reason=str(self.reason),
                 )
-                await notify_member(
-                    self.target,
-                    title="Исключение из состава",
-                    text=f"Твоё участие в **The Faceless Ones** завершено.\n\nПричина: {self.reason}",
-                )
             else:
                 if self.new_rank_name is None:
                     raise RuntimeError("Не указан новый ранг.")
@@ -809,11 +1259,6 @@ class ReasonModal(discord.ui.Modal):
                     new_rank_name=self.new_rank_name,
                     action=self.action_name,
                     reason=str(self.reason),
-                )
-                await notify_member(
-                    self.target,
-                    title=self.action_name,
-                    text=f"Твой текущий ранг — **«{new_rank}»**.",
                 )
         except (PermissionError, LookupError, RuntimeError) as error:
             await send_private(interaction, str(error))
@@ -935,6 +1380,22 @@ class ManagementView(discord.ui.View):
         await interaction.response.send_modal(
             ReasonModal(title="Исключение", target=self.target, action="Исключение")
         )
+
+    @discord.ui.button(label="Поощрение", style=discord.ButtonStyle.success, row=2)
+    async def reward(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(
+            PersonnelEventModal(target=self.target, event_type="reward", title="Поощрение")
+        )
+
+    @discord.ui.button(label="Взыскание", style=discord.ButtonStyle.danger, row=2)
+    async def discipline(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(
+            PersonnelEventModal(target=self.target, event_type="discipline", title="Дисциплинарная запись")
+        )
+
+    @discord.ui.button(label="Отпуск", style=discord.ButtonStyle.secondary, row=2)
+    async def leave(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(LeaveModal(target=self.target))
 
     @discord.ui.button(label="Обновить", style=discord.ButtonStyle.secondary, row=1)
     async def refresh(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -1087,10 +1548,7 @@ class AccessStaticIdModal(discord.ui.Modal):
         )
 
 
-        dm_sent = await send_access_dm(
-            member=member,
-            static_id=static_id,
-        )
+        dm_sent = False
 
         log_sent = await send_access_log(
             member=member,
@@ -1272,10 +1730,7 @@ class AllianceStaticIdModal(discord.ui.Modal):
             reason=f"Самостоятельное подтверждение доступа. Static ID: {static_id}",
         )
 
-        dm_sent = await send_alliance_dm(
-            member=member,
-            static_id=static_id,
-        )
+        dm_sent = False
 
         log_sent = await send_alliance_log(
             member=member,
@@ -1361,6 +1816,12 @@ class FCLClient(discord.Client):
 
         logger.info("Синхронизировано команд: %s", len(synced))
         self.web_runner = await start_web_server()
+        if not leave_watcher.is_running():
+            leave_watcher.start()
+        if not weekly_reporter.is_running():
+            weekly_reporter.start()
+        if not anniversary_watcher.is_running():
+            anniversary_watcher.start()
 
     async def close(self) -> None:
         if self.web_runner is not None:
@@ -1414,6 +1875,191 @@ async def on_disconnect() -> None:
 @client.event
 async def on_resumed() -> None:
     logger.info("Соединение с Discord восстановлено.")
+
+
+@client.event
+async def on_message(message: discord.Message) -> None:
+    if isinstance(message.author, discord.Member) and not message.author.bot:
+        record_activity(message.author, "message")
+
+
+@client.event
+async def on_voice_state_update(
+    member: discord.Member,
+    before: discord.VoiceState,
+    after: discord.VoiceState,
+) -> None:
+    if not member.bot and before.channel != after.channel:
+        record_activity(member, "voice")
+
+
+@tasks.loop(hours=1)
+async def leave_watcher() -> None:
+    now = datetime.now(timezone.utc)
+    rows = db.connection.execute(
+        "SELECT id, guild_id, member_id, ends_at FROM leaves WHERE status = 'active'"
+    ).fetchall()
+
+    for row in rows:
+        end = datetime.fromisoformat(str(row["ends_at"]))
+        if end > now:
+            continue
+        guild = client.get_guild(int(row["guild_id"]))
+        if guild is None:
+            continue
+        member = guild.get_member(int(row["member_id"]))
+        role = get_role(guild, LEAVE_ROLE_NAME)
+        if member and role and role in member.roles:
+            try:
+                await member.remove_roles(role, reason="Окончание отпуска")
+            except (discord.Forbidden, discord.HTTPException):
+                logger.warning("Не удалось снять роль отпуска.")
+        db.connection.execute("UPDATE leaves SET status = 'closed' WHERE id = ?", (int(row["id"]),))
+        db.connection.commit()
+
+
+@leave_watcher.before_loop
+async def before_leave_watcher() -> None:
+    await client.wait_until_ready()
+
+
+
+
+@tasks.loop(hours=24)
+async def anniversary_watcher() -> None:
+    if ANNIVERSARY_CHANNEL_ID is None or GUILD_ID is None:
+        return
+
+    guild = client.get_guild(GUILD_ID)
+    if guild is None:
+        return
+    channel = guild.get_channel(ANNIVERSARY_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        return
+
+    today = datetime.now(timezone.utc).date()
+    rows = db.connection.execute(
+        """
+        SELECT member_id, created_at
+        FROM member_profiles
+        WHERE guild_id = ?
+        """,
+        (guild.id,),
+    ).fetchall()
+
+    for row in rows:
+        joined = datetime.fromisoformat(str(row["created_at"])).date()
+        days = (today - joined).days
+
+        milestone = None
+        if days in {30, 90, 180, 365}:
+            milestone = days
+        elif days >= 730 and days % 365 == 0:
+            milestone = days
+
+        if milestone is None:
+            continue
+
+        already = db.connection.execute(
+            """
+            SELECT 1
+            FROM anniversary_events
+            WHERE guild_id = ? AND member_id = ? AND milestone_days = ?
+            """,
+            (guild.id, int(row["member_id"]), milestone),
+        ).fetchone()
+        if already:
+            continue
+
+        member = guild.get_member(int(row["member_id"]))
+        if member is None:
+            continue
+
+        if milestone < 365:
+            period = f"{milestone} дней"
+        else:
+            years = milestone // 365
+            period = f"{years} год" if years == 1 else f"{years} года"
+
+        embed = discord.Embed(
+            title="ГОДОВЩИНА В СЕМЬЕ",
+            description=(
+                f"Сегодня исполняется **{period}** с момента, "
+                f"когда {member.mention} стал(а) частью The Faceless Ones."
+            ),
+            color=discord.Color.purple(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_footer(text="Верность времени не подвластна.")
+
+        try:
+            await channel.send(embed=embed)
+            db.connection.execute(
+                """
+                INSERT INTO anniversary_events (
+                    guild_id, member_id, milestone_days, announced_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (guild.id, member.id, milestone, utc_now_iso()),
+            )
+            db.connection.commit()
+        except (discord.Forbidden, discord.HTTPException):
+            logger.warning("Не удалось опубликовать годовщину.")
+
+
+@anniversary_watcher.before_loop
+async def before_anniversary_watcher() -> None:
+    await client.wait_until_ready()
+
+
+@tasks.loop(hours=168)
+async def weekly_reporter() -> None:
+    if WEEKLY_REPORT_CHANNEL_ID is None or GUILD_ID is None:
+        return
+    guild = client.get_guild(GUILD_ID)
+    if guild is None:
+        return
+    channel = guild.get_channel(WEEKLY_REPORT_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        return
+
+    since_iso = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    access_count = db.connection.execute(
+        "SELECT COUNT(*) AS amount FROM access_events WHERE guild_id = ? AND created_at >= ?",
+        (guild.id, since_iso),
+    ).fetchone()["amount"]
+    rank_count = db.connection.execute(
+        "SELECT COUNT(*) AS amount FROM rank_history WHERE guild_id = ? AND created_at >= ?",
+        (guild.id, since_iso),
+    ).fetchone()["amount"]
+    rewards = db.connection.execute(
+        "SELECT COUNT(*) AS amount FROM personnel_events WHERE guild_id = ? AND event_type = 'reward' AND created_at >= ?",
+        (guild.id, since_iso),
+    ).fetchone()["amount"]
+    disciplines = db.connection.execute(
+        "SELECT COUNT(*) AS amount FROM personnel_events WHERE guild_id = ? AND event_type = 'discipline' AND created_at >= ?",
+        (guild.id, since_iso),
+    ).fetchone()["amount"]
+
+    embed = discord.Embed(
+        title="НЕДЕЛЬНЫЙ ОБЗОР",
+        description="Сводка изменений внутри The Faceless Ones за последние семь дней.",
+        color=discord.Color.purple(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Новые допуски", value=str(access_count), inline=True)
+    embed.add_field(name="Кадровые изменения", value=str(rank_count), inline=True)
+    embed.add_field(name="Поощрения", value=str(rewards), inline=True)
+    embed.add_field(name="Взыскания", value=str(disciplines), inline=True)
+    embed.set_footer(text="The Faceless Ones • внутренняя статистика")
+    await channel.send(embed=embed)
+
+
+@weekly_reporter.before_loop
+async def before_weekly_reporter() -> None:
+    await client.wait_until_ready()
+
+
 
 
 @tree.command(
@@ -1511,6 +2157,232 @@ async def create_alliance_access_message(
         interaction,
         "Сообщение с кнопкой доступа к Посольству опубликовано.",
     )
+
+
+@tree.command(name="мой-профиль", description="Показать ваше личное дело.")
+async def my_profile(interaction: discord.Interaction) -> None:
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        await send_private(interaction, "Команда доступна только на сервере.")
+        return
+
+    await interaction.response.send_message(
+        embed=member_card_embed(interaction.user, interaction.guild),
+        ephemeral=True,
+    )
+
+
+@tree.command(name="наставник", description="Назначить наставника участнику.")
+@app_commands.describe(участник="Новый участник", наставник="Назначаемый наставник")
+async def assign_mentor(
+    interaction: discord.Interaction,
+    участник: discord.Member,
+    наставник: discord.Member,
+) -> None:
+    actor = await validate_manager(interaction)
+    if actor is None or interaction.guild is None:
+        return
+    db.connection.execute(
+        """
+        INSERT INTO mentorships (guild_id, mentee_id, mentor_id, created_at, status)
+        VALUES (?, ?, ?, ?, 'active')
+        ON CONFLICT(guild_id, mentee_id) DO UPDATE SET
+            mentor_id = excluded.mentor_id,
+            created_at = excluded.created_at,
+            status = 'active'
+        """,
+        (interaction.guild.id, участник.id, наставник.id, utc_now_iso()),
+    )
+    db.connection.commit()
+    await send_private(interaction, f"{наставник.mention} назначен наставником для {участник.mention}.")
+
+
+@tree.command(name="достижение", description="Добавить достижение в личное дело.")
+@app_commands.describe(участник="Участник", название="Название достижения", описание="Описание достижения")
+async def add_achievement(
+    interaction: discord.Interaction,
+    участник: discord.Member,
+    название: str,
+    описание: str,
+) -> None:
+    actor = await validate_manager(interaction)
+    if actor is None or interaction.guild is None:
+        return
+    db.connection.execute(
+        """
+        INSERT INTO achievements (created_at, guild_id, member_id, actor_id, title, description)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (utc_now_iso(), interaction.guild.id, участник.id, actor.id, название, описание),
+    )
+    db.connection.commit()
+    await send_private(interaction, "Достижение добавлено в личное дело.")
+
+
+@tree.command(name="хроника", description="Добавить новое событие в хронику семьи.")
+async def chronicle_command(interaction: discord.Interaction) -> None:
+    if await validate_manager(interaction) is None:
+        return
+    await interaction.response.send_modal(ChronicleModal())
+
+
+@tree.command(name="неактив", description="Показать участников с длительным отсутствием активности.")
+@app_commands.describe(дней="Количество дней без активности")
+async def inactivity_report(
+    interaction: discord.Interaction,
+    дней: app_commands.Range[int, 1, 365] = 14,
+) -> None:
+    if await validate_manager(interaction) is None or interaction.guild is None:
+        return
+    threshold = datetime.now(timezone.utc) - timedelta(days=int(дней))
+    rows = db.connection.execute(
+        """
+        SELECT member_id, last_activity_at
+        FROM activity_log
+        WHERE guild_id = ? AND last_activity_at < ?
+        ORDER BY last_activity_at ASC LIMIT 30
+        """,
+        (interaction.guild.id, threshold.isoformat()),
+    ).fetchall()
+    if not rows:
+        await send_private(interaction, f"Участников без активности более {дней} дней не найдено.")
+        return
+    lines = [
+        f"<@{row['member_id']}> — {discord.utils.format_dt(datetime.fromisoformat(str(row['last_activity_at'])), style='R')}"
+        for row in rows
+    ]
+    embed = discord.Embed(title="КОНТРОЛЬ АКТИВНОСТИ", description="\n".join(lines), color=discord.Color.purple())
+    embed.set_footer(text=f"Без активности более {дней} дней")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@tree.command(name="союз", description="Создать или обновить паспорт союзной семьи.")
+@app_commands.describe(название="Название союзной семьи", представитель="Основной представитель", описание="Краткое описание союза")
+async def alliance_passport(
+    interaction: discord.Interaction,
+    название: str,
+    представитель: str,
+    описание: str,
+) -> None:
+    actor = await validate_manager(interaction)
+    if actor is None or interaction.guild is None:
+        return
+    db.connection.execute(
+        """
+        INSERT INTO alliances (guild_id, name, started_at, status, representative, description)
+        VALUES (?, ?, ?, 'active', ?, ?)
+        ON CONFLICT(guild_id, name) DO UPDATE SET
+            representative = excluded.representative,
+            description = excluded.description,
+            status = 'active'
+        """,
+        (interaction.guild.id, название, utc_now_iso(), представитель, описание),
+    )
+    db.connection.commit()
+    embed = discord.Embed(title=f"СОЮЗ • {название}", description=описание, color=discord.Color.purple())
+    embed.add_field(name="Статус", value="Действующий", inline=True)
+    embed.add_field(name="Представитель", value=представитель, inline=True)
+    embed.set_footer(text="The Faceless Ones • дипломатический паспорт")
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="совместная-операция", description="Записать совместную операцию с союзной семьёй.")
+@app_commands.describe(союз="Название союзной семьи", название="Название операции", результат="Итог операции", участников="Количество участников")
+async def alliance_operation(
+    interaction: discord.Interaction,
+    союз: str,
+    название: str,
+    результат: str,
+    участников: app_commands.Range[int, 0, 1000],
+) -> None:
+    actor = await validate_manager(interaction)
+    if actor is None or interaction.guild is None:
+        return
+    db.connection.execute(
+        """
+        INSERT INTO alliance_operations (created_at, guild_id, alliance_name, title, result, participants)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (utc_now_iso(), interaction.guild.id, союз, название, результат, int(участников)),
+    )
+    db.connection.commit()
+    await send_private(interaction, "Совместная операция сохранена.")
+
+
+@tree.command(name="доска-почета", description="Показать участников с наибольшим числом заслуг.")
+async def honor_board(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        return
+    rows = db.connection.execute(
+        """
+        SELECT member_id, SUM(points) AS total_points
+        FROM (
+            SELECT member_id, COUNT(*) AS points
+            FROM personnel_events
+            WHERE guild_id = ? AND event_type = 'reward'
+            GROUP BY member_id
+            UNION ALL
+            SELECT member_id, COUNT(*) * 2 AS points
+            FROM achievements
+            WHERE guild_id = ?
+            GROUP BY member_id
+        )
+        GROUP BY member_id
+        ORDER BY total_points DESC LIMIT 10
+        """,
+        (interaction.guild.id, interaction.guild.id),
+    ).fetchall()
+    if not rows:
+        await send_private(interaction, "Доска почёта пока пуста.")
+        return
+    lines = [f"**{i}.** <@{row['member_id']}> — {row['total_points']} балл(ов)" for i, row in enumerate(rows, 1)]
+    embed = discord.Embed(title="ДОСКА ПОЧЁТА", description="\n".join(lines), color=discord.Color.purple())
+    embed.set_footer(text="The Faceless Ones • признание заслуг")
+
+    if HONOR_BOARD_CHANNEL_ID:
+        channel = interaction.guild.get_channel(HONOR_BOARD_CHANNEL_ID)
+        if isinstance(channel, discord.TextChannel):
+            await channel.send(embed=embed)
+            await send_private(interaction, "Доска почёта опубликована.")
+            return
+
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="статистика", description="Показать общую статистику семьи.")
+async def organization_stats(interaction: discord.Interaction) -> None:
+    if await validate_manager(interaction) is None or interaction.guild is None:
+        return
+    gid = interaction.guild.id
+    members = sum(
+        len(role.members)
+        for role_name in RANK_ROLE_NAMES
+        if (role := get_role(interaction.guild, role_name)) is not None
+    )
+    rewards = db.connection.execute(
+        "SELECT COUNT(*) AS amount FROM personnel_events WHERE guild_id = ? AND event_type = 'reward'",
+        (gid,),
+    ).fetchone()["amount"]
+    disciplines = db.connection.execute(
+        "SELECT COUNT(*) AS amount FROM personnel_events WHERE guild_id = ? AND event_type = 'discipline'",
+        (gid,),
+    ).fetchone()["amount"]
+    achievements_count = db.connection.execute(
+        "SELECT COUNT(*) AS amount FROM achievements WHERE guild_id = ?",
+        (gid,),
+    ).fetchone()["amount"]
+    alliances_count = db.connection.execute(
+        "SELECT COUNT(*) AS amount FROM alliances WHERE guild_id = ? AND status = 'active'",
+        (gid,),
+    ).fetchone()["amount"]
+
+    embed = discord.Embed(title="THE FACELESS ONES • СТАТИСТИКА", color=discord.Color.purple())
+    embed.add_field(name="Ранговых назначений", value=str(members), inline=True)
+    embed.add_field(name="Поощрений", value=str(rewards), inline=True)
+    embed.add_field(name="Взысканий", value=str(disciplines), inline=True)
+    embed.add_field(name="Достижений", value=str(achievements_count), inline=True)
+    embed.add_field(name="Действующих союзов", value=str(alliances_count), inline=True)
+    embed.set_footer(text="FCL Management")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @tree.command(name="управление", description="Открыть панель управления составом.")

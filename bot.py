@@ -35,6 +35,20 @@ PLENIPOTENTIARY_ROLE_NAME: Final[str] = os.getenv(
 PORT: Final[int] = int(os.getenv("PORT", "10000"))
 DATABASE_PATH: Final[str] = os.getenv("DATABASE_PATH", "fcl_management.db")
 
+BASE_DIR: Final[Path] = Path(__file__).resolve().parent
+ASSETS_DIR: Final[Path] = BASE_DIR / "assets"
+
+BANNER_FILES: Final[dict[str, Path]] = {
+    "promotion": ASSETS_DIR / "promotion.png",
+    "achievement": ASSETS_DIR / "achievement.png",
+    "anniversary": ASSETS_DIR / "anniversary.png",
+    "chronicle": ASSETS_DIR / "chronicle.png",
+    "weekly_report": ASSETS_DIR / "weekly_report.png",
+    "plenipotentiary": ASSETS_DIR / "plenipotentiary.png",
+    "alliance": ASSETS_DIR / "alliance.png",
+    "honor_board": ASSETS_DIR / "honor_board.png",
+}
+
 GUILD_ID: Final[int | None] = int(GUILD_ID_RAW) if GUILD_ID_RAW else None
 ROLE_CHANNEL_ID: Final[int | None] = int(ROLE_CHANNEL_ID_RAW) if ROLE_CHANNEL_ID_RAW else None
 LOG_CHANNEL_ID: Final[int | None] = int(LOG_CHANNEL_ID_RAW) if LOG_CHANNEL_ID_RAW else None
@@ -718,8 +732,12 @@ async def send_access_log(
     embed.add_field(name="Идентификация", value=nickname, inline=False)
     embed.set_footer(text="The Faceless Ones • журнал допуска")
 
+    banner = attach_banner(embed, "achievement")
     try:
-        await channel.send(embed=embed)
+        if banner is not None:
+            await channel.send(embed=embed, file=banner)
+        else:
+            await channel.send(embed=embed)
         return True
     except (discord.Forbidden, discord.HTTPException):
         logger.warning("Не удалось отправить запись в журнал допуска.")
@@ -867,8 +885,12 @@ async def publish_rank_announcement(
     embed.add_field(name="Новый ранг", value=f"**{new_rank}**", inline=True)
     embed.set_footer(text="The Faceless Ones • путь продолжается")
 
+    banner = attach_banner(embed, "promotion")
     try:
-        await channel.send(embed=embed)
+        if banner is not None:
+            await channel.send(embed=embed, file=banner)
+        else:
+            await channel.send(embed=embed)
     except (discord.Forbidden, discord.HTTPException):
         logger.warning("Не удалось опубликовать объявление о назначении.")
 
@@ -1323,7 +1345,11 @@ class ChronicleModal(discord.ui.Modal):
                     timestamp=datetime.now(timezone.utc),
                 )
                 embed.set_footer(text="Хроника The Faceless Ones")
-                await channel.send(embed=embed)
+                banner = attach_banner(embed, "chronicle")
+                if banner is not None:
+                    await channel.send(embed=embed, file=banner)
+                else:
+                    await channel.send(embed=embed)
         await send_private(interaction, "Запись добавлена в хронику.")
 
 
@@ -1495,6 +1521,20 @@ async def grant_veteran_achievement(member: discord.Member) -> bool:
         )
 
     return True
+
+
+def attach_banner(
+    embed: discord.Embed,
+    banner_key: str,
+) -> discord.File | None:
+    path = BANNER_FILES.get(banner_key)
+    if path is None or not path.exists():
+        logger.warning("Баннер «%s» не найден: %s", banner_key, path)
+        return None
+
+    filename = path.name
+    embed.set_image(url=f"attachment://{filename}")
+    return discord.File(path, filename=filename)
 
 
 class ReasonModal(discord.ui.Modal):
@@ -2278,8 +2318,12 @@ async def anniversary_watcher() -> None:
         )
         embed.set_footer(text="Верность времени не подвластна.")
 
+        banner = attach_banner(embed, "anniversary")
         try:
-            await channel.send(embed=embed)
+            if banner is not None:
+                await channel.send(embed=embed, file=banner)
+            else:
+                await channel.send(embed=embed)
             db.connection.execute(
                 """
                 INSERT INTO anniversary_events (
@@ -2338,7 +2382,11 @@ async def weekly_reporter() -> None:
     embed.add_field(name="Поощрения", value=str(rewards), inline=True)
     embed.add_field(name="Взыскания", value=str(disciplines), inline=True)
     embed.set_footer(text="The Faceless Ones • внутренняя статистика")
-    await channel.send(embed=embed)
+    banner = attach_banner(embed, "weekly_report")
+    if banner is not None:
+        await channel.send(embed=embed, file=banner)
+    else:
+        await channel.send(embed=embed)
 
 
 @weekly_reporter.before_loop
@@ -2655,8 +2703,12 @@ async def appoint_plenipotentiary(
             embed.set_footer(
                 text="The Faceless Ones • журнал дипломатии"
             )
+            banner = attach_banner(embed, "plenipotentiary")
             try:
-                await channel.send(embed=embed)
+                if banner is not None:
+                    await channel.send(embed=embed, file=banner)
+                else:
+                    await channel.send(embed=embed)
             except (discord.Forbidden, discord.HTTPException):
                 logger.warning(
                     "Не удалось опубликовать назначение полномочного посла."
@@ -2750,7 +2802,11 @@ async def alliance_passport(
         text="The Faceless Ones • дипломатический паспорт"
     )
 
-    await interaction.response.send_message(embed=embed)
+    banner = attach_banner(embed, "alliance")
+    if banner is not None:
+        await interaction.response.send_message(embed=embed, file=banner)
+    else:
+        await interaction.response.send_message(embed=embed)
 
 
 @tree.command(name="доска-почета", description="Показать участников с наибольшим числом заслуг.")
@@ -2786,7 +2842,11 @@ async def honor_board(interaction: discord.Interaction) -> None:
     if HONOR_BOARD_CHANNEL_ID:
         channel = interaction.guild.get_channel(HONOR_BOARD_CHANNEL_ID)
         if isinstance(channel, discord.TextChannel):
-            await channel.send(embed=embed)
+            banner = attach_banner(embed, "honor_board")
+            if banner is not None:
+                await channel.send(embed=embed, file=banner)
+            else:
+                await channel.send(embed=embed)
             await send_private(interaction, "Доска почёта опубликована.")
             return
 
